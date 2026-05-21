@@ -84,7 +84,7 @@ int main() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow* window = glfwCreateWindow(config.winWidth, config.winHeight, "IMGUI INTRO 1.1.1", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(config.winWidth, config.winHeight, "LifeGame_GPU 1.1.1", nullptr, nullptr);
     if (!window) {
         glfwTerminate();
         return -1;

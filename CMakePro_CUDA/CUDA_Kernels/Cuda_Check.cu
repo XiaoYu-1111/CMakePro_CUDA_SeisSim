@@ -90,8 +90,6 @@ extern "C" bool RunCudaTest(float* h_a, float* h_b, float* h_c, int n) {
 
 static curandState* d_randStates = nullptr;
 
-// 外部调用接口
-
 // 内部使用的随机数状态，只需初始化一次
 static curandState* d_states = nullptr;
 
@@ -131,7 +129,8 @@ extern "C" void SeedCudaLife(uint8_t* d_world, int w, int h, float density) {
 }
 
 // 核心：逻辑更新核函数
-__global__ void kLifeUpdate(const uint8_t* current, uint8_t* next, float* heatMap, int w, int h, float dt, bool paused,float decay) {
+__global__ void kLifeUpdate(const uint8_t* current, uint8_t* next, float* heatMap, int w, int h, float dt, 
+                            bool paused,float decay,int b_mask, int s_mask) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
@@ -142,16 +141,18 @@ __global__ void kLifeUpdate(const uint8_t* current, uint8_t* next, float* heatMa
         for (int dy = -1; dy <= 1; dy++) {
             for (int dx = -1; dx <= 1; dx++) {
                 if (dx == 0 && dy == 0) continue;
-                int nx = (x + dx + w) % w;
-                int ny = (y + dy + h) % h;
-                neighbors += current[ny * w + nx];
+                neighbors += current[((y + dy + h) % h) * w + ((x + dx + w) % w)];
             }
         }
+
         uint8_t alive = current[idx];
-        next[idx] = alive ? (neighbors == 2 || neighbors == 3) : (neighbors == 3);
-    }
-    else {
-        next[idx] = current[idx];
+        // 使用位运算检查规则：判断 neighbors 对应的位是否在掩码中
+        if (alive) {
+            next[idx] = (s_mask & (1 << neighbors)) ? 1 : 0;
+        }
+        else {
+            next[idx] = (b_mask & (1 << neighbors)) ? 1 : 0;
+        }
     }
 
     // 热力图计算
@@ -171,10 +172,10 @@ __global__ void kLifeUpdate(const uint8_t* current, uint8_t* next, float* heatMa
     heatMap[idx] = hVal;
 }
 
-extern "C" void UpdateLifeCuda(uint8_t* d_current, uint8_t* d_next, float* d_heatMap, int w, int h, float deltaTime, bool paused,float decay) {
+extern "C" void UpdateLifeCuda(uint8_t* d_current, uint8_t* d_next, float* d_heatMap, int w, int h, float deltaTime, bool paused,float decay, int b_mask, int s_mask) {
     dim3 block(16, 16);
     dim3 grid((w + 15) / 16, (h + 15) / 16);
-    kLifeUpdate << <grid, block >> > (d_current, d_next, d_heatMap, w, h, deltaTime, paused, decay);
+    kLifeUpdate << <grid, block >> > (d_current, d_next, d_heatMap, w, h, deltaTime, paused, decay,  b_mask,  s_mask);
 }
 
 __global__ void kMousePaint(uint8_t* world, float* heatMap, int w, int h, int mx, int my, int radius, bool erase) {

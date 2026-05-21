@@ -36,7 +36,7 @@ extern "C" {
     void SeedCudaLife(uint8_t* d_world, int w, int h, float density);
     // 增加 decay 参数
     void UpdateLifeCuda(uint8_t* d_current, uint8_t* d_next, float* d_heatMap,
-        int w, int h, float deltaTime, bool paused, float decay);
+        int w, int h, float deltaTime, bool paused, float decay, int b_mask, int s_mask);
     void MousePaintCuda(uint8_t* d_world, float* d_heat, int w, int h, int mx, int my, int radius, bool erase);
     int GetPopulationCuda(uint8_t* d_world, int w, int h);
 #ifdef __cplusplus
