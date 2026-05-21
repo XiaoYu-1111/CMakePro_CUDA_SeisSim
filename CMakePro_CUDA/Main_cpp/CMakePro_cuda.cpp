@@ -48,39 +48,6 @@
  // =================================================================================
  // 主函数
  // =================================================================================
-void InitQuad(GLHandles& gl) {
-    // 定义 4 个顶点：位置(x,y,z) + 纹理坐标(u,v)
-    float vertices[] = {
-        // 位置              // 纹理坐标
-        -1.0f,  1.0f, 0.0f,  0.0f, 1.0f,  // 左上
-        -1.0f, -1.0f, 0.0f,  0.0f, 0.0f,  // 左下
-         1.0f, -1.0f, 0.0f,  1.0f, 0.0f,  // 右下
-
-        -1.0f,  1.0f, 0.0f,  0.0f, 1.0f,  // 左上
-         1.0f, -1.0f, 0.0f,  1.0f, 0.0f,  // 右下
-         1.0f,  1.0f, 0.0f,  1.0f, 1.0f   // 右上
-    };
-
-    glGenVertexArrays(1, &gl.quadVAO);
-    glGenBuffers(1, &gl.quadVBO);
-
-    glBindVertexArray(gl.quadVAO);
-
-    glBindBuffer(GL_ARRAY_BUFFER, gl.quadVBO);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), &vertices, GL_STATIC_DRAW);
-
-    // 位置属性 (Location 0)
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
-
-    // 纹理坐标属性 (Location 1)
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
-
-    glBindVertexArray(0);
-}
-
-
 
 int main() {
 
@@ -155,6 +122,30 @@ int main() {
     glAttachShader(gl.renderProg, fs);
     glLinkProgram(gl.renderProg);
 
+
+    // 在 gl.renderProg 链接之后
+    glGenTextures(1, &gl.lifeTex);
+    glBindTexture(GL_TEXTURE_2D, gl.lifeTex);
+    // 我们使用 GL_R32F 存储热力值（0.0 ~ 1.0）
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, 1920, 1080, 0, GL_RED, GL_FLOAT, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+    // 注册纹理到 CUDA
+    cudaGraphicsGLRegisterImage(&gl.cudaRes, gl.lifeTex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
+
+    // 初始化 CUDA 内部缓冲区
+    // --- [初始化部分] ---
+    InitCudaLife(1920, 1080); // 初始化随机数生成器
+    cudaMalloc(&gl.d_current, 1920 * 1080);
+    cudaMalloc(&gl.d_next, 1920 * 1080);
+    cudaMalloc(&gl.d_heatData, 1920 * 1080 * sizeof(float));
+
+    // 必须：给初始数据！
+    SeedCudaLife(gl.d_current, 1920, 1080, 0.3f);
+
     // 初始化 ImGui 与 ImPlot
     Init_Imgui(window);
     ImPlot::CreateContext();
@@ -168,8 +159,6 @@ int main() {
     // ============================================================
     // 2. 主循环 (Main Loop)
     // ============================================================
-
-
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
         // 1. 首先清除整个屏幕（必须在所有渲染之前）

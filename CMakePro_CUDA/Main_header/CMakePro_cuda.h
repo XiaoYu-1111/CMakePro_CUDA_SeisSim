@@ -418,6 +418,7 @@ void RenderIntroScreen0(SimState& state, int winW, int winH, bool& isIntroMode, 
             ImGui::TextColored({ 0, 0.8f, 1, 0.8f }, ">> ANALYTICS.UNIT");
             ImGui::Separator(); ImGui::Spacing();
             HubButton("BIOME_LAB", "Conway's biological cellular automata laboratory.", AppScreen::LifeGame, IM_COL32(0, 255, 255, 220));
+            HubButton("BIOME_LAB_GPU", "Conway's biological cellular automata laboratory.", AppScreen::LifeGame2, IM_COL32(0, 255, 255, 220));
             ImGui::TableSetColumnIndex(2);
             ImGui::TextColored({ 0, 1, 0.6f, 1 }, ">> COMPUTE.ENGINES");
             ImGui::Separator(); ImGui::Spacing();
@@ -1454,12 +1455,328 @@ void RenderLifeGameScreen(SimState& state, int winW, int winH) {
     }
 }
 
-// 结构体定义
-struct WebNode {
-    float phase;
-    float radiusOffset;
-    float driftSpeed;
-};
+//GPU版本生命游戏
+void ReallocateSimulation(GLHandles& gl, int newW, int newH) {
+    // 1. 强制同步：确保 CPU/GPU/OpenGL 所有任务全部停下
+    glFinish();
+    cudaDeviceSynchronize();
+
+    // 2. 释放旧资源 (严格清理)
+    if (gl.cudaRes) {
+        cudaGraphicsUnregisterResource(gl.cudaRes);
+        gl.cudaRes = nullptr; // 必须归零
+    }
+
+    // 释放显存并归零指针
+    auto SafeFree = [](void** ptr) {
+        if (*ptr) { cudaFree(*ptr); *ptr = nullptr; }
+        };
+    SafeFree((void**)&gl.d_current);
+    SafeFree((void**)&gl.d_next);
+    SafeFree((void**)&gl.d_heatData);
+
+    if (gl.lifeTex) {
+        glDeleteTextures(1, &gl.lifeTex);
+        gl.lifeTex = 0;
+    }
+
+    // 3. 更新尺寸
+    gl.simW = newW;
+    gl.simH = newH;
+
+    // 4. 重新分配 CUDA 显存
+    // 检查返回值以确保显存足够
+    cudaError_t e1 = cudaMalloc(&gl.d_current, gl.simW * gl.simH);
+    cudaError_t e2 = cudaMalloc(&gl.d_next, gl.simW * gl.simH);
+    cudaError_t e3 = cudaMalloc(&gl.d_heatData, gl.simW * gl.simH * sizeof(float));
+
+    if (e1 != cudaSuccess || e2 != cudaSuccess || e3 != cudaSuccess) {
+        printf("CUDA Malloc Failed! Out of Memory?\n");
+        return;
+    }
+
+    // 5. 重新初始化随机数状态 (这个非常重要，d_states 必须重置)
+    InitCudaLife(gl.simW, gl.simH);
+
+    // 6. 重新分配 OpenGL 纹理 (使用正确的内部格式)
+    glGenTextures(1, &gl.lifeTex);
+    glBindTexture(GL_TEXTURE_2D, gl.lifeTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, gl.simW, gl.simH, 0, GL_RED, GL_FLOAT, nullptr);
+
+    // 必须设置这些参数，否则纹理采样会返回黑色
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+    // 7. 重新注册 CUDA 互操作
+    cudaGraphicsGLRegisterImage(&gl.cudaRes, gl.lifeTex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
+
+    // 8. 填充初始数据
+    SeedCudaLife(gl.d_current, gl.simW, gl.simH, 0.3f);
+    cudaMemset(gl.d_heatData, 0, gl.simW * gl.simH * sizeof(float));
+
+    // 9. 最后一次同步，确保数据写进去了
+    cudaDeviceSynchronize();
+}
+
+void RenderLifeGameScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl) {
+    ImGuiIO& io = ImGui::GetIO();
+
+    const float scale = (float)winW / 1920.0f;
+
+    // --- [1. 模拟参数持久化] ---
+    static int generation = 0;
+    static float totalSimTime = 0.0f;
+    static float tickTimer = 0.0f;
+    static float tickRate = 0.05f; // 步频 (秒/代)
+    static int population = 0;
+    static ImVec4 cellColor = ImVec4(0.54f, 0.95f, 0.3f, 1.0f);
+    static float randomDensity = 0.30f;
+
+    // 人口历史记录 (用于曲线)
+    static std::vector<float> popHistory(1800, 0.0f);
+    static int hIdx = 0;
+    static bool showHUD = true;           // 控制面板开关
+
+    // --- [2. CUDA 逻辑计算 (带步频控制)] ---
+    cudaGraphicsMapResources(1, &gl.cudaRes, 0);
+    cudaGraphicsSubResourceGetMappedArray(&gl.cudaArray, gl.cudaRes, 0, 0);
+
+    // --- [1. 定义持久化的视图变量] ---
+    static float viewZoom = 1.0f;
+    static ImVec2 viewOffset = { 0.0f, 0.0f };
+
+    // --- [2. 鼠标缩放与平移逻辑] ---
+    if (!io.WantCaptureMouse) {
+        // A. 滚轮缩放
+        if (io.MouseWheel != 0) {
+            float mouseSpeed = 0.1f * viewZoom; // 缩放灵敏度随当前缩放倍数调整
+            viewZoom += io.MouseWheel * mouseSpeed;
+            if (viewZoom < 0.1f) viewZoom = 0.1f;   // 最小缩放
+            if (viewZoom > 1000.0f) viewZoom = 1000.0f; // 最大缩放
+        }
+
+        // B. 中键平移 (Button 2)
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+            // 根据缩放级别调整平移速度，确保平移跟手
+            viewOffset.x -= io.MouseDelta.x / (winW * viewZoom);
+            viewOffset.y += io.MouseDelta.y / (winH * viewZoom); // Y翻转
+        }
+    }
+    // --- [5. 核心修正：鼠标交互逻辑] ---
+    // --- [核心修正：计算比例修正] ---
+    float winAspect = (float)winW / (float)winH;
+    float simAspect = (float)gl.simW / (float)gl.simH;
+    ImVec2 aspectCorr = { 1.0f, 1.0f };
+    if (winAspect > simAspect) {
+        aspectCorr.x = winAspect / simAspect;
+    }
+    else {
+        aspectCorr.y = simAspect / winAspect;
+    }
+
+    // --- [鼠标交互逻辑更新] ---
+    if (!io.WantCaptureMouse) {
+        if (ImGui::IsMouseDown(0) || ImGui::IsMouseDown(1)) {
+            // 1. 归一化鼠标 [0, 1]
+            float normX = io.MousePos.x / (float)winW;
+            float normY = 1.0f - (io.MousePos.y / (float)winH);
+
+            // 2. 逆运算 (加入 aspectCorr)
+            // 注意：这里是乘法，因为在 VS 里是除法
+            float worldX = (normX - 0.5f) * (aspectCorr.x / viewZoom) + 0.5f + viewOffset.x;
+            float worldY = (normY - 0.5f) * (aspectCorr.y / viewZoom) + 0.5f + viewOffset.y;
+
+            int mx = (int)(worldX * (float)gl.simW);
+            int my = (int)(worldY * (float)gl.simH);
+
+            if (mx >= 0 && mx < gl.simW && my >= 0 && my < gl.simH) {
+                MousePaintCuda(gl.d_current, gl.d_heatData, gl.simW, gl.simH, mx, my, 1, ImGui::IsMouseDown(1));
+            }
+        }
+    }
+    // --- [3. CUDA 计算部分] ---
+// (保持原有的 Map/Update/Unmap 代码...)
+// 每 10 帧更新一次人口数量，平衡性能
+    // --- [1. 静态变量部分] ---
+    static float trailDecay = 0.85f; // 默认衰减系数
+    if (state.running) {
+        tickTimer += io.DeltaTime;
+        totalSimTime += io.DeltaTime;
+        if (tickTimer >= tickRate) {
+            tickTimer = 0;
+            generation++;
+            UpdateLifeCuda(gl.d_current, gl.d_next, gl.d_heatData, gl.simW, gl.simH, io.DeltaTime, false, trailDecay);
+            cudaMemcpy(gl.d_current, gl.d_next, gl.simH * gl.simW, cudaMemcpyDeviceToDevice);
+
+            // 每隔几代更新一次人口统计，节省性能
+            if (generation % 10 == 0) {
+                population = GetPopulationCuda(gl.d_current, gl.simW, gl.simH);
+            }
+        }
+    }
+    else {
+        // 暂停时只更新热力图衰减
+
+        // --- [2. 逻辑调用部分] ---
+        UpdateLifeCuda(gl.d_current, gl.d_next, gl.d_heatData, gl.simW, gl.simH, io.DeltaTime, !state.running, trailDecay);
+    }
+
+    // 更新历史曲线数据
+    popHistory[hIdx] = (float)population;
+    hIdx = (hIdx + 1) % 1800;
+
+    cudaMemcpy2DToArray(
+        gl.cudaArray, 0, 0,
+        gl.d_heatData,
+        gl.simW * sizeof(float), // 这里是 Source Pitch
+        gl.simW * sizeof(float), // 这里是 Width in bytes
+        gl.simH,                 // 这里是 Height
+        cudaMemcpyDeviceToDevice
+    );
+    cudaGraphicsUnmapResources(1, &gl.cudaRes, 0);
+
+    // --- [3. 渲染背景与全屏网格] ---
+    glViewport(0, 0, winW, winH);
+    glUseProgram(gl.renderProg);
+
+    // 传递缩放和平移参数
+    glUniform2f(glGetUniformLocation(gl.renderProg, "winSize"), (float)winW, (float)winH);
+    glUniform2f(glGetUniformLocation(gl.renderProg, "simSize"), (float)gl.simW, (float)gl.simH);
+    glUniform2f(glGetUniformLocation(gl.renderProg, "viewOffset"), viewOffset.x, viewOffset.y);
+    glUniform1f(glGetUniformLocation(gl.renderProg, "viewZoom"), viewZoom);
+
+    glUniform3f(glGetUniformLocation(gl.renderProg, "cellColor"), cellColor.x, cellColor.y, cellColor.z);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, gl.lifeTex);
+    glUniform1i(glGetUniformLocation(gl.renderProg, "lifeTexture"), 0);
+    glBindVertexArray(gl.quadVAO);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+
+    // --- [4. 顶部状态栏 (还原风格)] ---
+    ImGui::SetNextWindowPos({ 0, 0 });
+    ImGui::SetNextWindowSize({ (float)winW, 48.0f * scale });
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.02f, 0.05f, 0.04f, 0.7f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::Begin("TopBar", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove);
+    {
+        ImGui::SetCursorPos({ 25 * scale, 15 * scale });
+        ImGui::TextColored({ 0.0f, 1.0f, 0.75f, 1.0f }, "SYS_ID: GPU_CORE_V12 // CUDA_ACCELERATED");
+
+        int h = (int)totalSimTime / 3600, m = ((int)totalSimTime / 60) % 60, s = (int)totalSimTime % 60;
+        char statusStr[128];
+        sprintf(statusStr, "SIM_TIME: %02d:%02d:%02d <<gen: %d // %d Units>>", h, m, s, generation, population);
+        float textWidth = ImGui::CalcTextSize(statusStr).x;
+        ImGui::SetCursorPos({ (winW - textWidth) * 0.5f, 15 * scale });
+        ImGui::TextColored(cellColor, "%s", statusStr);
+
+        // 右侧控制：添加 HUD 开关
+        ImGui::SetCursorPos({ (float)winW - 240 * scale, 12 * scale });
+        ImGui::TextDisabled("[ %.0f FPS ]", io.Framerate);
+        ImGui::SameLine();
+
+        ImGui::SameLine();
+
+        // --- 核心修改：控制面板开关 ---
+        ImGui::PushStyleColor(ImGuiCol_CheckMark, { 0, 1, 0.8f, 1 });
+        ImGui::Checkbox("HUD_INTERFACE", &showHUD);
+        ImGui::PopStyleColor();
+    }
+    ImGui::End();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+
+    // 装饰线逻辑 (完全拷贝 CPU 版本)
+    ImDrawList* topDraw = ImGui::GetForegroundDrawList();
+    topDraw->AddLine({ 0, 48.0f * scale }, { (float)winW, 48.0f * scale }, IM_COL32(0, 255, 190, 40), 1.0f);
+
+    // --- [4. 悬浮控制窗 (可调整大小 + 磨砂玻璃)] ---
+    if (showHUD) {
+        // --- [5. 悬浮控制窗 (磨砂玻璃风格)] ---
+        ImGui::SetNextWindowPos({ 30 * scale, 80 * scale }, ImGuiCond_FirstUseEver);
+        //ImGui::SetNextWindowSize({ 340 * scale, 620 * scale });
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.12f, 0.12f, 0.6f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1, 1, 1, 0.2f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.0f);
+
+        // 静态变量用于存储 UI 输入值（避免输入时立即触发重分配）
+        static int inputW = gl.simW;
+        static int inputH = gl.simH;
+
+        if (ImGui::Begin("LAB_CONTROLS", &showHUD)) {
+
+            ImGui::TextColored({ 0, 1, 1, 1 }, "SYSTEM_CONFIGURATION");
+
+            // 分辨率输入
+            ImGui::InputInt("WIDTH", &inputW);
+            ImGui::InputInt("HEIGHT", &inputH);
+
+            // 限制范围防止崩溃
+            if (inputW < 64) inputW = 64; if (inputH < 64) inputH = 64;
+            if (inputW > 4096) inputW = 4096; if (inputH > 4096) inputH = 4096;
+
+            if (ImGui::Button("APPLY & REBOOT CORE", { -1, 40 })) {
+                ReallocateSimulation(gl, inputW, inputH);
+            }
+
+            ImGui::Separator();
+            // --- [3. UI 控制部分] ---
+            ImGui::TextColored(cellColor, "VISUAL_EFFECTS");
+            // 滑块范围 0.0 (无轨迹) 到 0.99 (超长轨迹)
+            ImGui::SliderFloat("TRAIL_DECAY", &trailDecay, 0.0f, 0.99f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Lower = Crisper blinking\nHigher = Longer trails");
+
+            // 显示当前实际尺寸
+            ImGui::Text("CURRENT_GRID: %d x %d", gl.simW, gl.simH);
+            ImGui::Text("TOTAL_CELLS: %d", gl.simW * gl.simH);
+            // A. 初始化
+            ImGui::TextColored(cellColor, "PRESET_BIOMASS");
+            if (ImGui::Button("RANDOM_SEED", { -1, 35 * scale })) {
+                SeedCudaLife(gl.d_current, 1920, 1080, randomDensity);
+                generation = 0;
+                totalSimTime = 0;
+            }
+            ImGui::SliderFloat("DENSITY", &randomDensity, 0.01f, 0.5f);
+
+            ImGui::Separator();
+
+            // B. 环境参数
+            ImGui::TextColored(cellColor, "ENVIRONMENT");
+            ImGui::ColorEdit3("CELL_COLOR", (float*)&cellColor, ImGuiColorEditFlags_NoInputs);
+            ImGui::SliderFloat("TICK_SPD", &tickRate, 0.001f, 0.2f, "%.3fs");
+
+            ImGui::Checkbox("ENABLE_VSYNC", &state.vsyncEnabled);
+            if (ImGui::IsItemDeactivatedAfterEdit()) glfwSwapInterval(state.vsyncEnabled ? 1 : 0);
+
+            // C. 运行控制
+            bool isPaused = !state.running;
+            if (ImGui::Checkbox("PAUSE_SIMULATION", &isPaused)) state.running = !isPaused;
+
+            // D. 性能与人口图表
+            ImGui::PlotLines("##Flux", popHistory.data(), 1800, hIdx, "BIOMASS_DENSITY", 0, 100000.0f, { -1, 100 * scale });
+
+            ImGui::Text("POPULATION: %d Units", population);
+            ImGui::Text("VIEW_ZOOM: %.2fx", viewZoom);
+            if (ImGui::Button("RESET VIEW")) { viewZoom = 1.0f; viewOffset = { 0,0 }; }
+
+            // E. 退出按钮
+            ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 55 * scale);
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.1f, 0.1f, 0.6f));
+            if (ImGui::Button("TERMINATE_SESSION", { -1, 35 * scale })) {
+                state.currentScreen = AppScreen::Intro0;
+            }
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::End();
+
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(2);
+
+    }
+}
 
 //界面4,HAM 界面设计
 void RenderHamStationScreen(SimState& state, int winW, int winH) {
@@ -1899,9 +2216,7 @@ void RenderHamStationScreen(SimState& state, int winW, int winH) {
 
 }
 
-// =================================================================================
-// CUDA Debug Window (English Version to avoid encoding issues)
-// =================================================================================
+//GPU信息界面
 void RenderCudaDiagnosticsScreen(SimState& state, const GpuInfo& info, int winW, int winH) {
     const float scale = (float)winW / 1920.0f;
     ImGuiIO& io = ImGui::GetIO();
@@ -2067,6 +2382,9 @@ void RenderApp(AppScreen screen, SimState& state, const GpuInfo& info, int winW,
     case AppScreen::LifeGame:
         RenderLifeGameScreen(state, winW, winH);
         break;
+    case AppScreen::LifeGame2:
+        RenderLifeGameScreen_GPU(state, winW, winH,gl);
+        break;
     case AppScreen::HamStation:
         RenderHamStationScreen(state, winW, winH);
         break;
@@ -2131,14 +2449,51 @@ void CheckIdleStatus(GLFWwindow* window, SimState& state) {
 
 //资源清理
 void cleanup(GLHandles& gl) {
-    glDeleteTextures(2, gl.texVel);
-    glDeleteTextures(2, gl.texStress);
-    glDeleteTextures(1, &gl.texMedium);
-    glDeleteBuffers(1, &gl.quadVBO);
-    glDeleteBuffers(1, &gl.sourceSSBO);
-    glDeleteVertexArrays(1, &gl.quadVAO);
-    glDeleteProgram(gl.computeProg);
-    glDeleteProgram(gl.renderProg);
+    // --- 1. 注销 CUDA 与 OpenGL 的互操作资源 ---
+    if (gl.cudaRes) {
+        // 在删除 OpenGL 纹理之前，必须先注销注册的资源
+        cudaGraphicsUnregisterResource(gl.cudaRes);
+        gl.cudaRes = nullptr;
+    }
+
+    // --- 2. 释放 CUDA 申请的逻辑缓冲区 (显存) ---
+    if (gl.d_current) {
+        cudaFree(gl.d_current);
+        gl.d_current = nullptr;
+    }
+    if (gl.d_next) {
+        cudaFree(gl.d_next);
+        gl.d_next = nullptr;
+    }
+    if (gl.d_heatData) {
+        cudaFree(gl.d_heatData);
+        gl.d_heatData = nullptr;
+    }
+
+    // --- 3. 清理 OpenGL 纹理 ---
+    if (gl.lifeTex) {
+        glDeleteTextures(1, &gl.lifeTex);
+        gl.lifeTex = 0;
+    }
+
+    // --- 4. 清理基础几何资源 (原有逻辑) ---
+    if (gl.quadVBO) {
+        glDeleteBuffers(1, &gl.quadVBO);
+        gl.quadVBO = 0;
+    }
+    if (gl.quadVAO) {
+        glDeleteVertexArrays(1, &gl.quadVAO);
+        gl.quadVAO = 0;
+    }
+
+    // --- 5. 清理着色器程序 (原有逻辑) ---
+    if (gl.renderProg) {
+        glDeleteProgram(gl.renderProg);
+        gl.renderProg = 0;
+    }
+
+    // 重置 CUDA 数组指针（它是通过映射获取的，不需要单独释放）
+    gl.cudaArray = nullptr;
 }
 
 //处理键盘操作

@@ -19,7 +19,8 @@ enum class AppScreen {
     Intro0 = 0,     // 启动欢迎页 (Logo/版权)
     Intro1,         // 引导页1
     Intro2,         // 引导页2
-    LifeGame,     // 核心分型渲染/模拟界面
+    LifeGame,       // 生命游戏cpu
+    LifeGame2,       // 生命游戏gpu
     HamStation,
     CudaDiagno,
     Count
@@ -66,30 +67,33 @@ struct SimConfig {
 // ===================================================================
 // 4. OpenGL/GPU 资源句柄与 Uniform 缓存
 // ===================================================================
+#include <cuda_runtime.h>
+#include <cuda_gl_interop.h> // 必须包含这个头文件以支持互操作
+
 struct GLHandles {
-    // --- 模拟计算资源 (FDTD/Compute) ---
-    GLuint texVel[2] = { 0, 0 }; // 速度场纹理
-    GLuint texStress[2] = { 0, 0 }; // 应力场纹理
-    GLuint texMedium = 0;        // 介质属性纹理
-    GLuint computeProg = 0;        // 计算着色器程序
-    GLuint sourceSSBO = 0;        // 波源数据缓存
-    GLuint statusSSBO = 0;        // 状态读取缓存
+    // --- 1. 渲染程序与基础几何 ---
+    GLuint renderProg = 0;           // 片段着色器程序 (渲染全屏纹理)
+    GLuint quadVAO = 0, quadVBO = 0; // 全屏矩形的顶点数据
 
-    // --- 渲染资源 (Fractal/Rendering) ---
-    GLuint renderProg = 0;        // 核心渲染程序 (分型)
-    GLuint fractalProg = 0;        // 备用分型计算程序
-    GLuint fractalTex = 0;        // 分型结果缓存纹理
-    GLuint quadVAO = 0, quadVBO = 0; // 全屏渲染矩形顶点
+    // --- 2. OpenGL 纹理 (生命游戏数据中心) ---
+    GLuint lifeTex = 0;              // 映射到显存的纹理句柄 (存储热力值)
 
-    // --- Uniform 位置缓存 (优化性能，避免每帧查找字符串) ---
-    GLint loc_time = -1;           // u_time
-    GLint loc_res = -1;           // u_resolution
-    GLint loc_center = -1;           // u_center
-    GLint loc_zoom = -1;           // u_zoom
-    GLint loc_iters = -1;           // u_iters
-    GLint loc_smooth = -1;           // u_enableSmooth
-    GLint loc_scan = -1;           // u_enableScanlines
-    GLint loc_style = 0;
+    // --- 3. CUDA-OpenGL 互操作句柄 ---
+    // 注意：cudaRes 必须是指针类型 (cudaGraphicsResource_t)
+    struct cudaGraphicsResource* cudaRes = nullptr;
+
+    // 映射后的 CUDA 数组，用于将 CUDA 计算结果拷贝到 OpenGL 纹理
+    cudaArray_t cudaArray = nullptr;
+
+    // --- 4. CUDA 专用显存缓冲区 (Device Pointers) ---
+    // 为了效率，逻辑计算使用原始显存指针，计算后再拷贝到上面的纹理
+    uint8_t* d_current = nullptr;    // 当前代细胞状态 (0 或 1)
+    uint8_t* d_next = nullptr;       // 下一代细胞状态
+    float* d_heatData = nullptr;   // 显存中的热力值数组 (0.0f - 1.0f)
+
+    int simW = 1920;
+    int simH = 1080;
+
 };
 
 // ===================================================================
@@ -164,3 +168,36 @@ inline GLuint createShader(const std::string& source, GLenum type) {
     }
     return shader;
 }
+
+void InitQuad(GLHandles& gl) {
+    // 定义 4 个顶点：位置(x,y,z) + 纹理坐标(u,v)
+    float vertices[] = {
+        // 位置              // 纹理坐标
+        -1.0f,  1.0f, 0.0f,  0.0f, 1.0f,  // 左上
+        -1.0f, -1.0f, 0.0f,  0.0f, 0.0f,  // 左下
+         1.0f, -1.0f, 0.0f,  1.0f, 0.0f,  // 右下
+
+        -1.0f,  1.0f, 0.0f,  0.0f, 1.0f,  // 左上
+         1.0f, -1.0f, 0.0f,  1.0f, 0.0f,  // 右下
+         1.0f,  1.0f, 0.0f,  1.0f, 1.0f   // 右上
+    };
+
+    glGenVertexArrays(1, &gl.quadVAO);
+    glGenBuffers(1, &gl.quadVBO);
+
+    glBindVertexArray(gl.quadVAO);
+
+    glBindBuffer(GL_ARRAY_BUFFER, gl.quadVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), &vertices, GL_STATIC_DRAW);
+
+    // 位置属性 (Location 0)
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
+
+    // 纹理坐标属性 (Location 1)
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
+
+    glBindVertexArray(0);
+}
+
