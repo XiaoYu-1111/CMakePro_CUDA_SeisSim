@@ -128,7 +128,7 @@ void Init_Imgui(GLFWwindow* window) {
     float scaleFactor = 1.5f;
     float fontSize = baseSize * scaleFactor;
 
-    std::string font_path = "../resources_gpu_v32/font/consola.ttf";
+    std::string font_path = "../resources_LifeGame_V2/font/consola.ttf";
 
     // 尝试加载自定义字体
     ImFont* font = io.Fonts->AddFontFromFileTTF(font_path.c_str(), fontSize);
@@ -409,23 +409,21 @@ void RenderIntroScreen0(SimState& state, int winW, int winH, bool& isIntroMode, 
             ImGui::TableSetColumnIndex(0);
             ImGui::TextColored({ 1.0f, 0.3f, 0.3f, 1.0f }, ">> INFRASTRUCTURE.LOG");
             ImGui::Separator(); ImGui::Spacing();
-            HubButton("AUTH_LOGO", "System encryption and identity authentication protocols.", AppScreen::Intro1, IM_COL32(0, 255, 255, 180));
-            HubButton("INTERFACE", "User experience guidelines and input mappings.", AppScreen::Intro2, IM_COL32(0, 255, 255, 180));
-            HubButton("CudaDiagno", "RenderCudaDiagnosticsScreen.", AppScreen::CudaDiagno, IM_COL32(0, 255, 255, 180));
+            HubButton("AUTH_LOGO", "Initialize secure kernel handshake and identity verification nodes.", AppScreen::Intro1, IM_COL32(0, 255, 255, 180));
+            HubButton("INTERFACE", "Neural-link topology and system-wide input mapping configuration.", AppScreen::Intro2, IM_COL32(0, 255, 255, 180));
+            HubButton("CORE_DIAG", "Real-time GPGPU throughput analysis and hardware health telemetry.", AppScreen::CudaDiagno, IM_COL32(0, 255, 255, 180));
 
-            
             ImGui::TableSetColumnIndex(1);
             ImGui::TextColored({ 0, 0.8f, 1, 0.8f }, ">> ANALYTICS.UNIT");
             ImGui::Separator(); ImGui::Spacing();
-            HubButton("BIOME_LAB", "Conway's biological cellular automata laboratory.", AppScreen::LifeGame, IM_COL32(0, 255, 255, 220));
-            HubButton("BIOME_LAB_GPU", "Conway's biological cellular automata laboratory.", AppScreen::LifeGame2, IM_COL32(0, 255, 255, 220));
+            HubButton("BIOME_HOST_CPU", "Heuristic cellular evolution via sequential x64 logic processing.", AppScreen::LifeGame, IM_COL32(0, 255, 255, 220));
+            HubButton("BIOME_ACCEL_GPU", "Massively parallel biosphere synthesis utilizing CUDA tensor cores.", AppScreen::LifeGame2, IM_COL32(0, 255, 255, 220));
+            
             ImGui::TableSetColumnIndex(2);
             ImGui::TextColored({ 0, 1, 0.6f, 1 }, ">> COMPUTE.ENGINES");
             ImGui::Separator(); ImGui::Spacing();
-            
-            HubButton("HamStation", "RenderHamStationScreen.", AppScreen::HamStation, IM_COL32(0, 255, 255, 220));
+            HubButton("RF_STATION", "Multi-band RF signal interception and automated spectrum analysis.", AppScreen::HamStation, IM_COL32(0, 255, 255, 220));
 
-            
             ImGui::EndTable();
         }
 
@@ -1135,7 +1133,7 @@ void RenderIntroScreen2(SimState& state, int winW, int winH, bool& isIntroMode, 
     ImGui::PopStyleColor(1); ImGui::PopStyleVar(2);
 }
 
-//界面3,生命游戏渲染函数
+//界面3,生命游戏渲染CPU
 void ApplyPattern(std::vector<uint8_t>& world, int w, int h, int type, int& gen) {
     std::fill(world.begin(), world.end(), 0);
     gen = 0;
@@ -1185,17 +1183,40 @@ void RenderLifeGameScreen(SimState& state, int winW, int winH) {
     ImGuiIO& io = ImGui::GetIO();
     ImDrawList* draw = ImGui::GetBackgroundDrawList();
 
-    // --- [1. 模拟状态持久化] ---
+    // --- [1. 模拟状态与视口变量] ---
     static  int gridW = 240, gridH = 135;
-    // 新增：用于在 UI 中编辑的临时变量（避免拖动滑条时实时崩溃）
     static int nextGridW = 240, nextGridH = 135;
-
-
     static std::vector<uint8_t> world(gridW * gridH, 0), nextWorld(gridW * gridH, 0);
     static std::vector<float> heatMap(gridW * gridH, 0.0f);
 
-    static float randomDensity = 0.28f; // 默认 18% 密度
-    // --- 新增：默认随机化初始化逻辑 ---
+
+    // --- 新增：视口控制变量 ---
+    static float zoom = 1.0f;           // 缩放倍率
+    static ImVec2 viewOffset = { 0, 0 };  // 平移偏移量
+    static float randomDensity = 0.28f;
+
+    // --- [2. 缩放与平移控制逻辑] ---
+    if (!io.WantCaptureMouse) {
+        // A. 鼠标滚轮缩放
+        if (io.MouseWheel != 0.0f) {
+            float oldZoom = zoom;
+            zoom += io.MouseWheel * 0.1f * zoom; // 指数级缩放感
+            if (zoom < 0.5f) zoom = 0.5f;        // 最小缩放限制
+            if (zoom > 50.0f) zoom = 50.0f;      // 最大缩放限制
+
+            // 核心：以鼠标当前位置为中心进行缩放
+            ImVec2 mousePos = io.MousePos;
+            viewOffset.x -= (mousePos.x - viewOffset.x) * (zoom / oldZoom - 1.0f);
+            viewOffset.y -= (mousePos.y - viewOffset.y) * (zoom / oldZoom - 1.0f);
+        }
+
+        // B. 鼠标中键（或右键）按下平移
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+            viewOffset.x += io.MouseDelta.x;
+            viewOffset.y += io.MouseDelta.y;
+        }
+    }
+    // --- [3. 核心计算与模拟逻辑] ---
     static bool firstRun = true;
     if (firstRun) {
         for (int i = 0; i < gridW * gridH; ++i) {
@@ -1227,30 +1248,52 @@ void RenderLifeGameScreen(SimState& state, int winW, int winH) {
         };
 
     // --- [2. 磨砂玻璃背景渲染] ---
-    // 渐变基底
-    // --- [2. 磨砂玻璃背景渲染] ---
-// 渐变基底
     draw->AddRectFilledMultiColor({ 0,0 }, { (float)winW, (float)winH },
         IM_COL32(10, 35, 30, 255), IM_COL32(20, 55, 45, 255),
         IM_COL32(5, 25, 20, 255), IM_COL32(10, 30, 25, 255));
     // 磨砂白光层
     draw->AddRectFilled({ 0,0 }, { (float)winW, (float)winH }, IM_COL32(200, 255, 230, 15));
 
-
     // 1. 提前计算当前分辨率下的细胞像素宽高
-    float cw = (float)winW / gridW;
-    float ch = (float)winH / gridH;
+    // --- [4. 渲染映射逻辑] ---
+    // 基础细胞大小
+    float baseCw = (float)winW / gridW;
+    float baseCh = (float)winH / gridH;
 
-    // 2. 绘制垂直网格线 (基于 gridW)
-    for (int x = 0; x <= gridW; ++x) {
-        float posX = x * cw;
-        draw->AddLine({ posX, 0 }, { posX, (float)winH }, IM_COL32(255, 255, 255, 12));
-    }
+    // 实际渲染时的细胞大小（受 zoom 影响）
+    float cw = baseCw * zoom;
+    float ch = baseCh * zoom;
 
-    // 3. 绘制水平网格线 (基于 gridH)
-    for (int y = 0; y <= gridH; ++y) {
-        float posY = y * ch;
-        draw->AddLine({ 0, posY }, { (float)winW, posY }, IM_COL32(255, 255, 255, 12));
+    // 绘制背景与网格 (仅在网格不至于太密时绘制)
+    // C. 绘制网格与边界线
+// 1. 计算模拟世界的总宽高（屏幕像素）
+    float totalWorldW = gridW * cw;
+    float totalWorldH = gridH * ch;
+
+    // 2. 绘制外边界框 (无论缩放比例如何都显示)
+    // 颜色建议：使用 cellColor 的半透明版，或者亮青色增加科技感
+    ImU32 borderColor = ImGui::ColorConvertFloat4ToU32({ cellColor.x, cellColor.y, cellColor.z, 0.8f });
+    draw->AddRect(
+        { viewOffset.x, viewOffset.y },                             // 左上角
+        { viewOffset.x + totalWorldW, viewOffset.y + totalWorldH }, // 右下角
+        borderColor,
+        0.0f,           // 圆角
+        0,              // 边框标志
+        2.0f * scale    // 线宽（随 UI 缩放，但不随 zoom 缩放，保持线条清晰）
+    );
+
+    // 3. 内部细网格线 (仅在放大时显示)
+    if (zoom > 2.5f) {
+        for (int x = 0; x <= gridW; ++x) {
+            float posX = x * cw + viewOffset.x;
+            if (posX >= 0 && posX <= winW)
+                draw->AddLine({ posX, viewOffset.y }, { posX, viewOffset.y + totalWorldH }, IM_COL32(255, 255, 255, 12));
+        }
+        for (int y = 0; y <= gridH; ++y) {
+            float posY = y * ch + viewOffset.y;
+            if (posY >= 0 && posY <= winH)
+                draw->AddLine({ viewOffset.x, posY }, { viewOffset.x + totalWorldW, posY }, IM_COL32(255, 255, 255, 12));
+        }
     }
 
     // --- [3. 核心模拟逻辑] ---
@@ -1280,13 +1323,43 @@ void RenderLifeGameScreen(SimState& state, int winW, int winH) {
     history[hIdx] = (float)pop; hIdx = (hIdx + 1) % 1800;
 
     // 绘制细胞（光晕效果）
+
     ImU32 cCore = ImGui::ColorConvertFloat4ToU32(cellColor);
     ImU32 cAura = ImGui::ColorConvertFloat4ToU32({ cellColor.x, cellColor.y, cellColor.z, 0.25f });
+
+
     for (int i = 0; i < gridW * gridH; ++i) {
         if (heatMap[i] > 0.01f) {
-            ImVec2 p = { (float)(i % gridW) * cw, (float)(i / gridW) * ch };
-            draw->AddCircleFilled({ p.x + cw / 2, p.y + ch / 2 }, cw * heatMap[i] * 0.9f, cAura);
-            if (world[i]) draw->AddCircleFilled({ p.x + cw / 2, p.y + ch / 2 }, cw * 0.38f, cCore);
+            int ix = i % gridW;
+            int iy = i / gridW;
+            // 计算带偏移和缩放的坐标
+            float px = ix * cw + viewOffset.x;
+            float py = iy * ch + viewOffset.y;
+
+            // 视口裁剪优化：只绘制屏幕内的细胞
+            if (px + cw < 0 || px > winW || py + ch < 0 || py > winH) continue;
+
+            draw->AddCircleFilled({ px + cw / 2, py + ch / 2 }, cw * heatMap[i] * 0.9f, cAura);
+            if (world[i]) draw->AddCircleFilled({ px + cw / 2, py + ch / 2 }, cw * 0.38f, cCore);
+        }
+    }
+
+    // --- [5. 交互逻辑修正] ---
+    if (!io.WantCaptureMouse) {
+        // 将鼠标屏幕坐标 转换为 模拟网格坐标
+        // 公式：gridX = (mouse.x - offset.x) / (baseSize * zoom)
+        int mx = (int)((io.MousePos.x - viewOffset.x) / cw);
+        int my = (int)((io.MousePos.y - viewOffset.y) / ch);
+
+        if (mx >= 0 && mx < gridW && my >= 0 && my < gridH) {
+            if (ImGui::IsMouseDown(0)) {
+                world[my * gridW + mx] = 1;
+                heatMap[my * gridW + mx] = 1.0f;
+            }
+            if (ImGui::IsMouseDown(1)) {
+                world[my * gridW + mx] = 0;
+                heatMap[my * gridW + mx] = 0.0f;
+            }
         }
     }
 
@@ -1392,6 +1465,10 @@ void RenderLifeGameScreen(SimState& state, int winW, int winH) {
                 ResizeWorld(nextGridW, nextGridH);
             }
             ImGui::Spacing();
+            if (ImGui::Button("RESET_VIEW", { -1, 30 * scale })) {
+                zoom = 1.0f;
+                viewOffset = { 0, 0 };
+            }
 
             ImGui::Spacing();
             ImGui::TextColored(cellColor, "ENVIRONMENT");
@@ -1443,15 +1520,6 @@ void RenderLifeGameScreen(SimState& state, int winW, int winH) {
         ImGui::End();
         ImGui::PopStyleVar(2);
         ImGui::PopStyleColor(2);
-    }
-
-    // --- [6. 交互逻辑 (左键画，右键擦)] ---
-    if (!io.WantCaptureMouse) {
-        int mx = (int)(io.MousePos.x / cw), my = (int)(io.MousePos.y / ch);
-        if (mx >= 0 && mx < gridW && my >= 0 && my < gridH) {
-            if (ImGui::IsMouseDown(0)) { world[my * gridW + mx] = 1; heatMap[my * gridW + mx] = 1.0f; }
-            if (ImGui::IsMouseDown(1)) { world[my * gridW + mx] = 0; heatMap[my * gridW + mx] = 0.0f; }
-        }
     }
 }
 
@@ -1526,7 +1594,7 @@ void RenderLifeGameScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl
     static int generation = 0;
     static float totalSimTime = 0.0f;
     static float tickTimer = 0.0f; 
-    static float tickRate = 0.1f; // 步频 (秒/代)
+    static float tickRate = 0.05f; // 步频 (秒/代)
     static int population = 0;
 
     
@@ -1768,7 +1836,7 @@ void RenderLifeGameScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl
         // --- [5. 悬浮控制窗 (磨砂玻璃风格)] ---
         ImGui::SetNextWindowPos({ 30 * scale, 80 * scale }, ImGuiCond_FirstUseEver);
         //ImGui::SetNextWindowSize({ 340 * scale, 620 * scale });
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.12f, 0.12f, 0.6f));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.95f, 1.0f, 0.98f, 0.5f));// 0.95f, 1.0f, 0.98f, 0.18f
         ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1, 1, 1, 0.2f));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.0f);
 
@@ -2503,7 +2571,6 @@ void RenderCudaDiagnosticsScreen(SimState& state, const GpuInfo& info, int winW,
     ImGui::PopStyleVar(2);   // 对应 WindowRounding, WindowBorderSize
     ImGui::PopStyleColor(2); // 对应 WindowBg, Border
 }
-
 
 bool IsIntroScreen(AppScreen screen) {
     return (screen == AppScreen::Intro0 || screen == AppScreen::Intro1 
