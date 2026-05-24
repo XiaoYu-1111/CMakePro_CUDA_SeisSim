@@ -352,8 +352,8 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
             if (viewZoom > 100.0f) viewZoom = 100.0f;
         }
         if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
-            viewOffset.x -= io.MouseDelta.x / (winW * viewZoom);
-            viewOffset.y += io.MouseDelta.y / (winH * viewZoom);
+            viewOffset.x -= 2*io.MouseDelta.x / (winW * viewZoom);
+            viewOffset.y += 2*io.MouseDelta.y / (winH * viewZoom);
         }
     }
     // ============================================================
