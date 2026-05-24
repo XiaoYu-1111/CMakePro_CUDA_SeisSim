@@ -302,3 +302,11 @@ struct ViewportInfo {
     float scaleX = 1.0f; // 屏幕 X 像素 / 模拟 X 格数
     float scaleY = 1.0f; // 屏幕 Y 像素 / 模拟 Z 格数
 };
+
+// CUDA 显存端多震源参数结构体
+struct GPUSource {
+    int idx;       // 震源在 2D 数组中的 1D 展平索引
+    float t;       // 当前震源已传播的物理时间 (秒)
+    float f_peak;  // 震源的主频 f0
+    float amp;     // 震源的振幅
+};

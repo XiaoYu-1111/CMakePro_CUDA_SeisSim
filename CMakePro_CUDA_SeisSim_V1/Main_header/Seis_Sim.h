@@ -264,6 +264,14 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
     const float scale = (float)winW / 1920.0f;
     const float barHeight = 48.0f * scale; // 状态栏高度
 
+    // 【修改】：网格尺寸调节静态变量 (默认 1000 x 500)
+    static int edit_w = 1000;
+    static int edit_h = 500;
+
+    // 【新增】：子波主频 (f0) 与时间延迟 (t0) 的持久化变量，默认对齐启动参数
+    static float edit_f0 = 100.0f;
+    static float edit_t0 = 1 / edit_f0;
+
     // --- [1. 初始化地震模拟上下文与 GPU 显存] ---
     // --- [ 1. 初始化地震数据与纹理 ] ---
     static bool first_align_needed = false; // 用于标记是否需要执行首次对齐
@@ -271,11 +279,11 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
     if (!is_seis_initialized) {
 
         // 默认将模拟分辨率设置为 500x500 
-        par.model.xnum = 1000;
-        par.model.znum = 500;
+        par.model.xnum = edit_w; // 动态读取默认值
+        par.model.znum = edit_h; // 动态读取默认值
         par.model.dx = 1.0f; // 空间步长 1.0m
         par.model.dz = 1.0f;
-        par.FDM.f0 = 100.0f;  // 30Hz 配合 1.0m 网格，无频散 [8]
+        par.FDM.f0 = edit_f0;  // 30Hz 配合 1.0m 网格，无频散 [8]
         
         setupTestContext(ctx, par);
         initGPUSimulation(gpu_data, ctx);
@@ -296,7 +304,7 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
 
     // --- [2. 持久化模拟控制变量] ---
     static int current_it = 0;
-    static int accumulated_compute_time = 0;
+    static float accumulated_compute_time = 0;
     static float color_scale = 1e1f;
     static int show_component = 0; // 0: Vz, 1: Vx
     static int steps_per_frame = 10; // 每帧迭代物理步数
@@ -308,12 +316,12 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
     static int edit_src_z = ctx.NZ / 4;
     static float edit_angle = par.FDM.angle;
 
+    // 【新增】：多震源模式控制开关与 CPU 队列
+    static bool multi_source_mode = false;  // 默认不开启 (保持单点重置模式)
+    static std::vector<GPUSource> active_sources; // CPU 端的活跃震源容器
 
-
-    // 【新增】：子波主频 (f0) 与时间延迟 (t0) 的持久化变量，默认对齐启动参数
-    static float edit_f0 = 100.0f;
-    static float edit_t0 = 1/edit_f0;
-
+    // 【新增】：是否开启无限演化模式 (默认关闭)
+    static bool infinite_mode = false;
 
     // --- [3. 鼠标缩放与平移逻辑] ---
     static float viewZoom = 1.0f;
@@ -336,7 +344,6 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
         first_align_needed = false; // 首次对齐完成，关闭标记
     }
 
-
     if (!io.WantCaptureMouse) {
         if (io.MouseWheel != 0) {
             float mouseSpeed = 0.1f * viewZoom;
@@ -352,7 +359,29 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
     // ============================================================
     // 【完美修正版：鼠标左键点击注入震源】
     // ============================================================
-    if (!io.WantCaptureMouse && ImGui::IsMouseClicked(0)) {
+    // =============================================================================
+    // 【智能分流与频率限制系统：鼠标左键点击 / 按压拖动持续注入震源】
+    // =============================================================================
+    static double last_inject_time = 0.0;
+    double current_time = glfwGetTime();
+
+    bool trigger_active = false;
+
+    if (multi_source_mode) {
+        // A. 多震源模式：只要鼠标按住不放，且距离上一次注入超过 40ms (25Hz 频宽) 则持续注入
+        if (ImGui::IsMouseDown(0) && (current_time - last_inject_time >= 0.04)) {
+            trigger_active = true;
+            last_inject_time = current_time; // 刷新计时器
+        }
+    }
+    else {
+        // B. 单点震源模式：必须是单次点击触发，防止连续重置导致波场无法向前传播
+        if (ImGui::IsMouseClicked(0)) {
+            trigger_active = true;
+        }
+    }
+
+    if (!io.WantCaptureMouse && trigger_active) {
         float normX = io.MousePos.x / (float)winW;
         float normY = io.MousePos.y / (float)winH; // 0 at top, 1 at bottom
 
@@ -380,30 +409,50 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
         int my = (int)(worldY * (float)ctx.NZ);
 
         // PML 边界安全判定 [4]
-        int min_valid = ctx.npml + 5;
-        int max_valid_x = ctx.NX - ctx.npml - 5;
-        int max_valid_z = ctx.NZ - ctx.npml - 5;
+        int min_valid = ctx.npml + 0;
+        int max_valid_x = ctx.NX - ctx.npml - 0;
+        int max_valid_z = ctx.NZ - ctx.npml - 0;
 
         if (mx >= min_valid && mx <= max_valid_x && my >= min_valid && my <= max_valid_z) {
-            ctx.src_z_idx = my;
-            ctx.src_idx = my * ctx.NX + mx;
+            int clicked_idx = my * ctx.NX + mx;
 
-            // =========================================================
-            // 【新增】：鼠标点击时，直接反向同步刷新 UI 滑动条的值！
-            // =========================================================
-            edit_src_x = mx;
-            edit_src_z = my;
+            if (multi_source_mode) {
+                // =====================================================
+                // 【多点持续按压注入逻辑】：将震源送入 CPU 活跃队列并拷贝至 GPU
+                // =====================================================
+                GPUSource new_src;
+                new_src.idx = clicked_idx;
+                new_src.t = 0.0f;
+                new_src.f_peak = edit_f0; // 采用当前滑块设置的主频
+                new_src.amp = 1.0f;
 
-            // 重置并立即重新激发波动
-            current_it = 0;
-            accumulated_compute_time = 0.0f; // <-- 新增归零
-            state.running = true;
+                // 限制队列最大活跃数（设为 150），防止显存溢出
+                if (active_sources.size() < 150) {
+                    active_sources.push_back(new_src);
+                }
 
-            freeGPUSimulation(gpu_data);
-            initGPUSimulation(gpu_data, ctx);
+                // 实时同步 OSD 准星与滑块位置
+                edit_src_x = mx;
+                edit_src_z = my;
+            }
+            else {
+                // =====================================================
+                // 【单点重置注入逻辑】：点击一键重置并单独激发 (保持不变)
+                // =====================================================
+                ctx.src_z_idx = my;
+                ctx.src_idx = clicked_idx;
+                edit_src_x = mx;
+                edit_src_z = my;
 
-            std::fill(ctx.record_vx.begin(), ctx.record_vx.end(), 0.0f);
-            std::fill(ctx.record_vz.begin(), ctx.record_vz.end(), 0.0f);
+                current_it = 0;
+                state.running = true;
+                accumulated_compute_time = 0.0f;
+
+                freeGPUSimulation(gpu_data);
+                initGPUSimulation(gpu_data, ctx);
+                std::fill(ctx.record_vx.begin(), ctx.record_vx.end(), 0.0f);
+                std::fill(ctx.record_vz.begin(), ctx.record_vz.end(), 0.0f);
+            }
         }
     }
 
@@ -498,16 +547,39 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
         viewOffset.y = 1.0f - aspectCorr.y * (1.0f - 2.0f * barHeight / (float)winH);
 
         g_resetViewportRequested = false; // 消费信号，自动复位
+        active_sources.clear();
     }
 
     // --- [4. 执行 CUDA 有限差分时间演化] ---
-    if (state.running && current_it < ctx.nt) {
+    // 关键控制：如果开启了无限模式，则无视 nt 限制，一直向后迭代；否则在达到 nt 时停止
+    bool can_run = state.running && (infinite_mode || current_it < ctx.nt);
 
-        // 累加本次运行的真实计算耗时 [1.2.7]
+    if (can_run) {
         accumulated_compute_time += io.DeltaTime;
+
         for (int s = 0; s < steps_per_frame; ++s) {
-            if (current_it < ctx.nt) {
-                runGPUStep(gpu_data, current_it, ctx);
+            if (infinite_mode || current_it < ctx.nt) {
+
+                // 1. 更新多点激发寿命 (保持不变)
+                if (multi_source_mode && !active_sources.empty()) {
+                    for (auto it = active_sources.begin(); it != active_sources.end(); ) {
+                        it->t += ctx.dt;
+                        float t_peak = 1.0f / it->f_peak;
+                        if (it->t > 2.5f * t_peak) {
+                            it = active_sources.erase(it);
+                        }
+                        else {
+                            ++it;
+                        }
+                    }
+                    if (!active_sources.empty()) {
+                        cudaMemcpy(gpu_data.d_active_sources, active_sources.data(),
+                            active_sources.size() * sizeof(GPUSource), cudaMemcpyHostToDevice);
+                    }
+                }
+
+                // 2. 执行物理更新
+                runGPUStep(gpu_data, current_it, ctx, multi_source_mode ? (int)active_sources.size() : -1);
                 current_it++;
             }
         }
@@ -617,7 +689,7 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
             // 对实际计算耗时进行精美格式化
             char computeTimeStr[64];
             if (accumulated_compute_time < 60.0f) {
-                sprintf(computeTimeStr, "%.2f s", accumulated_compute_time);
+                sprintf(computeTimeStr, "%.6f s", accumulated_compute_time);
             }
             else {
                 int minutes = (int)(accumulated_compute_time) / 60;
@@ -625,9 +697,17 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
                 sprintf(computeTimeStr, "%02dm %.2fs", minutes, seconds);
             }
 
+            // 中间模拟参数指示
+            char stepStr[128];
+            if (infinite_mode) {
+                sprintf(stepStr, "%d / INF", current_it);
+            }
+            else {
+                sprintf(stepStr, "%d / %d", current_it, ctx.nt);
+            }
             char statusStr[512];
-            sprintf(statusStr, "FORMULATION: TYPE %d  |  STEP: %d / %d  |  PHYS TIME: %.4f s  |  COMPUTE TIME: %s",
-                ctx.flag_type, current_it, ctx.nt, physicalTime, computeTimeStr);
+            sprintf(statusStr, "FORMULATION: TYPE %d  |  STEP: %s  |  PHYS TIME: %.4f s  |  COMPUTE TIME: %s",
+                ctx.flag_type, stepStr, physicalTime, computeTimeStr);
 
             float textWidth = ImGui::CalcTextSize(statusStr).x;
             ImGui::SetCursorPos({ (winW - textWidth) * 0.5f, centerY });
@@ -739,8 +819,9 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
                     // 【回归】：网格物理步长 dx 调节滑块，滑块拖动时将直接联动屏幕上标尺的刻度米数！
                     ImGui::SliderFloat("Grid Spacing (dx)", &temp_dx, 0.1f, 20.0f, "%.1f m");
 
-                    ImGui::SliderInt("Max Steps (nt)", &temp_nt, 500, 20000);
-
+                    ImGui::SliderInt("Max Steps (nt)", &temp_nt, 500, 50000);
+                    ImGui::Spacing();
+                    
                     // 稳定性 OSD 显示
                     bool is_stable = (temp_dt <= dt_limit);
                     ImGui::Text("Max Allowed dt (CFL Limit): %.6f s", dt_limit);
@@ -797,12 +878,82 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
                     }
 
                     ImGui::Spacing();
+                    // =============================================================================
+                    // 【新增】：网格尺寸重置区 (实现模型大小实时在线修改) [1.2.7]
+                    // =============================================================================
+                    ImGui::Separator();
+                    ImGui::TextColored(uiAccent, "GRID DIMENSIONS (NX, NZ)");
+
+                    // 宽度调节加减组
+                    ImGui::PushItemWidth(100 * scale);
+                    ImGui::InputInt("##WidthVal", &edit_w, 0, 0); ImGui::SameLine();
+                    ImGui::PopItemWidth();
+                    if (ImGui::Button("-##WDec")) { edit_w = std::max(64, edit_w - 64); } ImGui::SameLine();
+                    if (ImGui::Button("+##WInc")) { edit_w = std::min(8192, edit_w + 64); } ImGui::SameLine();
+                    ImGui::Text("Grid Width (NX)"); 
+                    ImGui::Spacing();
+
+                    // 高度调节加减组
+                    ImGui::PushItemWidth(100 * scale);
+                    ImGui::InputInt("##HeightVal", &edit_h, 0, 0); ImGui::SameLine();
+                    ImGui::PopItemWidth();
+                    if (ImGui::Button("-##HDec")) { edit_h = std::max(64, edit_h - 64); } ImGui::SameLine();
+                    if (ImGui::Button("+##HInc")) { edit_h = std::min(8192, edit_h + 64); } ImGui::SameLine();
+                    ImGui::Text("Grid Height (NZ)");
+
+                    ImGui::Spacing();
+
+                    // 鲜红色的重构模型按钮
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.75f, 0.15f, 0.15f, 0.85f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.2f, 0.2f, 1.0f));
+                    if (ImGui::Button("APPLY NEW GRID SIZE & CLEAR MODEL", { -1, 35 * scale })) {
+                        // 1. 停止当前模拟并重置状态
+                        state.running = false;
+                        current_it = 0;
+                        accumulated_compute_time = 0.0f;
+                        active_sources.clear(); // 清空多震源
+
+                        // 2. 将最新的网格宽高写入 par
+                        par.model.xnum = edit_w;
+                        par.model.znum = edit_h;
+
+                        // 3. 重新在 CPU 端重构大小并计算差分系数
+                        setupTestContext(ctx, par);
+
+                        // 4. 释放旧的 GPU 显存
+                        freeGPUSimulation(gpu_data);
+
+                        // 5. 【核心安全保护】：注销旧纹理，调整 OpenGL 纹理大小，重新注册到 CUDA
+                        cudaGraphicsUnregisterResource(gl.cudaSeisRes);
+                        glBindTexture(GL_TEXTURE_2D, gl.seisTex);
+                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ctx.NX, ctx.NZ, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                        cudaGraphicsGLRegisterImage(&gl.cudaSeisRes, gl.seisTex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
+
+                        // 6. 重新申请并初始化新的 GPU 显存
+                        initGPUSimulation(gpu_data, ctx);
+
+                        // 7. 标记需要重新将视角对齐新视口的左上角
+                        first_align_needed = true;
+                    }
+                    ImGui::PopStyleColor(2);
+                    ImGui::Spacing();
                     ImGui::Separator();
                     ImGui::Checkbox("V-Sync Control", &state.vsyncEnabled);
                     if (ImGui::IsItemDeactivatedAfterEdit()) {
                         glfwSwapInterval(state.vsyncEnabled ? 1 : 0);
                     }
-
+                    ImGui::Spacing();
+                    // 【新增】：无限演化模式开关
+                    ImGui::Checkbox("Continuous Simulation (Infinite Mode)", &infinite_mode);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Check to run the wavefield tank indefinitely.\nIdeal for interactive sandbox clicking.");
+                    }
+                    ImGui::Spacing();
+                    // 新增：多震源模式实时开关 [1.2.7]
+                    ImGui::Checkbox("Enable Multi-Source Real-time Clicks", &multi_source_mode);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Check to click and spawn multiple intersecting waves simultaneously\nUncheck for standard single-point reset mode.");
+                    }
                     ImGui::EndTabItem();
                 }
 
@@ -810,8 +961,8 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
                 // 选项卡二：Physics & Source (物性与震源参数控制)
                 // -------------------------------------------------------------------------
                 if (ImGui::BeginTabItem("Physics & Source")) {
+                    
                     ImGui::Spacing();
-
                     // 1. 震源激发参数设置
                     ImGui::TextColored(uiAccent, "Source Position & Angle");
                     /*static int edit_src_x = ctx.NX / 2;
@@ -824,10 +975,9 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
 
                     ImGui::SliderInt("Source X (Grid)", &edit_src_x, min_valid_grid, max_valid_x);
                     ImGui::SliderInt("Source Z (Grid)", &edit_src_z, min_valid_grid, max_valid_z);
-
-
                     ImGui::SliderFloat("Force Angle", &edit_angle, -180.0f, 180.0f, "%.1f deg");
 
+                    
                     // 2. 【核心新增】：雷克子波主频与延迟控制 [6]
                     ImGui::Separator();
                     ImGui::TextColored(uiAccent, "Ricker Wavelet Properties");
@@ -892,6 +1042,23 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
                         initGPUSimulation(gpu_data, ctx);
                     }
                     ImGui::Spacing();
+                    // 【按钮激发单点震源回归】：在此处增加一个“按钮激发”机制 [1.2.7]
+                    if (ImGui::Button("TRIGGER SINGLE SOURCE SHOT (C)", { -1, 30 * scale })) {
+                        // 强制关闭多震源模式，以便执行单震源重置
+                        multi_source_mode = false;
+
+                        ctx.src_z_idx = edit_src_z;
+                        ctx.src_idx = edit_src_z * ctx.NX + edit_src_x;
+
+                        current_it = 0;
+                        state.running = true;
+                        accumulated_compute_time = 0.0f;
+
+                        freeGPUSimulation(gpu_data);
+                        initGPUSimulation(gpu_data, ctx);
+                        std::fill(ctx.record_vx.begin(), ctx.record_vx.end(), 0.0f);
+                        std::fill(ctx.record_vz.begin(), ctx.record_vz.end(), 0.0f);
+                    }
                     ImGui::Spacing();
 
                     // 2. 介质物性设置 (岩石物理耦合) [3]

@@ -95,12 +95,19 @@ struct GPUSimData {
     // 5. 震源与检波器
     float* d_wavelet = nullptr;
     int* d_rcv_grid_idx = nullptr;
+
+    float* d_record_vx_step = nullptr; // 大小：num_rcv * sizeof(float) (仅几百字节)
+    float* d_record_vz_step = nullptr; // 大小：num_rcv * sizeof(float)
+
+    GPUSource* d_active_sources = nullptr; // 活跃震源的显存缓冲区
+
+    int src_angle = 0;
 };
 
 // 接口函数
 void initGPUSimulation(GPUSimData& gpu, const SimulationContext& ctx);
 void freeGPUSimulation(GPUSimData& gpu);
-void runGPUStep(GPUSimData& gpu, int current_it, const SimulationContext& ctx);
+void runGPUStep(GPUSimData& gpu, int current_it, const SimulationContext& ctx,int num_active_sources);
 void copyRecordFromGPU(GPUSimData& gpu, int num_rcv, int nt, int current_it, float* h_rec_vx, float* h_rec_vz);
 void copyWavefieldToHost(GPUSimData& gpu, float* h_vz_out);
 void generateWavefieldTextureCUDA(GPUSimData& gpu, uchar4* d_rgba_out, float color_scale, int show_component);
