@@ -129,8 +129,8 @@ extern "C" void SeedCudaLife(uint8_t* d_world, int w, int h, float density) {
 }
 
 // 核心：逻辑更新核函数///并行卷积算子。
-__global__ void kLifeUpdate(const uint8_t* current, uint8_t* next, float* heatMap, int w, int h, float dt, 
-                            bool paused,float decay,int b_mask, int s_mask) {
+__global__ void kLifeUpdate(const uint8_t* current, uint8_t* next, float* heatMap, int w, int h, float dt,
+    bool paused, float decay, int b_mask, int s_mask) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
@@ -166,10 +166,10 @@ __global__ void kLifeUpdate(const uint8_t* current, uint8_t* next, float* heatMa
     heatMap[idx] = hVal;
 }
 
-extern "C" void UpdateLifeCuda(uint8_t* d_current, uint8_t* d_next, float* d_heatMap, int w, int h, float deltaTime, bool paused,float decay, int b_mask, int s_mask) {
+extern "C" void UpdateLifeCuda(uint8_t* d_current, uint8_t* d_next, float* d_heatMap, int w, int h, float deltaTime, bool paused, float decay, int b_mask, int s_mask) {
     dim3 block(16, 16);
     dim3 grid((w + 15) / 16, (h + 15) / 16);
-    kLifeUpdate << <grid, block >> > (d_current, d_next, d_heatMap, w, h, deltaTime, paused, decay,  b_mask,  s_mask);
+    kLifeUpdate << <grid, block >> > (d_current, d_next, d_heatMap, w, h, deltaTime, paused, decay, b_mask, s_mask);
 }
 
 __global__ void kMousePaint(uint8_t* world, float* heatMap, int w, int h, int mx, int my, int radius, bool erase) {

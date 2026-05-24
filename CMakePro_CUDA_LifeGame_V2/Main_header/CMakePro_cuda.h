@@ -651,7 +651,7 @@ void RenderIntroScreen1(SimState& state, int winW, int winH, bool& isIntroMode, 
 
                 ImGui::SetWindowFontScale(1.2f * scale);
                 float blinkAlpha = 0.3f + 0.7f * (0.5f * (1.0f + sin(ImGui::GetTime() * 4.0f)));
-                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, blinkAlpha), "● SYSTEM ONLINE");
+                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, blinkAlpha), "SYSTEM ONLINE");
             }
             ImGui::EndGroup();
         }
@@ -1901,6 +1901,7 @@ void RenderLifeGameScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl
             if (ImGui::Button("APPLY & REBOOT CORE", { -1, 40 })) {
                 ReallocateSimulation(gl, inputW, inputH);
                 viewZoom = 1.0f; viewOffset = { 0,0 };
+                cudaMemcpy(gl.d_next, gl.d_current, gl.simW* gl.simH, cudaMemcpyDeviceToDevice);
             }
             // 显示当前实际尺寸
             ImGui::Text("CURRENT_GRID: %d x %d", gl.simW, gl.simH);
@@ -1941,10 +1942,11 @@ void RenderLifeGameScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl
             }
             ImGui::SliderFloat("DENSITY", &randomDensity, 0.01f, 0.5f);
 
-            if (ImGui::Button("RE_SET", { -1, 35 * scale })) {
+            if (ImGui::Button("RESET WORLD", { -1, 35 * scale })) {
                 SeedCudaLife(gl.d_current, gl.simW, gl.simH, 0.0f);
                 generation = 0;
                 totalSimTime = 0;
+                cudaMemcpy(gl.d_next, gl.d_current, gl.simW * gl.simH, cudaMemcpyDeviceToDevice);
             }
 
             ImGui::Separator();

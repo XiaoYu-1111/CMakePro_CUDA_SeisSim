@@ -14,9 +14,9 @@ set(CMAKE_CUDA_COMPILE_OPTIONS_MSVC_PDB_OUTPUT_PATH "" CACHE STRING "" FORCE) # 
 set(CMAKE_CUDA_ARCHITECTURES native)
 
 # [关键修改] 显式声明支持 CUDA 语言
-project(CMakePro_CUDA LANGUAGES CXX C CUDA)
+project(CMakePro_CUDA_SeisSim_V1 LANGUAGES CXX C CUDA)
 
-set(TARGET_NAME "CMakePro_CUDA")
+set(TARGET_NAME "CMakePro_CUDA_SeisSim_V1")
 
 # ==========================================
 # 2. 第三方库路径设置 (保留绝对路径方式)
@@ -69,7 +69,7 @@ set_target_properties(${TARGET_NAME} PROPERTIES
 
 #解决cuda链接出错问题
 if (MSVC)
-    target_compile_options(CMakePro_CUDA PRIVATE
+    target_compile_options(${TARGET_NAME} PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:/FS>
     )
 endif()
@@ -85,19 +85,19 @@ target_compile_options(${TARGET_NAME} PRIVATE
 )
 
 # ==========================================
-# 6. 资源文件同步 (resources_gpu_v32)
+# 6. 资源文件同步 (resource_CUDA_V1)
 # ==========================================
-set(RESOURCE_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/resources_gpu_v32")
-set(RESOURCE_DEST_DIR "${CMAKE_BINARY_DIR}/resources_gpu_v32")
+set(RESOURCE_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/resource_CUDA_V1")
+set(RESOURCE_DEST_DIR "${CMAKE_BINARY_DIR}/resource_CUDA_V1")
 
 file(GLOB_RECURSE RESOURCE_FILES "${RESOURCE_SRC_DIR}/*")
 
-add_custom_target(copy_resources_gpu_v32
+add_custom_target(copy_resource_CUDA_V1
     COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different ${RESOURCE_SRC_DIR} ${RESOURCE_DEST_DIR}
     DEPENDS ${RESOURCE_FILES}
     COMMENT "Syncing resource files..."
 )
-add_dependencies(${TARGET_NAME} copy_resources_gpu_v32)
+add_dependencies(${TARGET_NAME} copy_resource_CUDA_V1)
 
 # ==========================================
 # 7. 配置头文件路径 (Include)

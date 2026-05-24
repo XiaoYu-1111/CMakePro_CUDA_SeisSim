@@ -57,6 +57,39 @@ void main() {
     // 3. 叠加网格 (使用尾迹颜色作为网格的荧光色，保持色调统一)
     finalColor += trailColor * gridFinal * 1.5;
 
+    // --- [新增：绘制内部边界白线] ---
+    // 将纹理坐标映射到实际网格单位 (0 到 simSize)
+    vec2 cellPos = TexCoords * simSize;
+    
+    // 计算当前点距离“向内1格”边界的距离
+    // 目标边界线位置：x=1, y=1, x=simSize.x-1, y=simSize.y-1
+    float dLeft   = abs(cellPos.x - 1.0);
+    float dRight  = abs(cellPos.x - (simSize.x - 1.0));
+    float dBottom = abs(cellPos.y - 1.0);
+    float dTop    = abs(cellPos.y - (simSize.y - 1.0));
+
+    // 获取四条边中最短的距离
+    float distToBorder = 1e6;
+    // 只有在矩形框范围内的像素才参与计算，防止线条延伸到无穷远
+    if(cellPos.x >= 0.9 && cellPos.x <= simSize.x - 0.9) {
+        distToBorder = min(distToBorder, dBottom);
+        distToBorder = min(distToBorder, dTop);
+    }
+    if(cellPos.y >= 0.9 && cellPos.y <= simSize.y - 0.9) {
+        distToBorder = min(distToBorder, dLeft);
+        distToBorder = min(distToBorder, dRight);
+    }
+
+    // 线条粗细 (像素单位，可根据需要调整)
+    float borderLineThickness = 1.5; 
+    // 使用 fwidth 实现屏幕空间的抗锯齿
+    float borderAA = fwidth(distToBorder);
+    float whiteBorder = smoothstep(borderAA * borderLineThickness, 0.0, distToBorder - 0.05);
+    
+    // 只有在视野缩放比较近的时候才显示白线，或者全程显示
+    finalColor = mix(finalColor, vec3(1.0, 1.0, 1.0), whiteBorder * 0.8); 
+
+
     // 4. 后期：扫描线 (Scanlines)
     float scanline = sin(TexCoords.y * 1080.0 + totalTime * 4.0) * 0.01;
     finalColor += scanline;

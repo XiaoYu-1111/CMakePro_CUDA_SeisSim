@@ -12,6 +12,7 @@ endif()
 project ("CMakePro_CUDA")
 
 # 包含子项目。
-add_subdirectory ("CMakePro_CUDA")
 add_subdirectory ("CMakePro_CUDA_LifeGame_V2")
+
+add_subdirectory ("CMakePro_CUDA_SeisSim_V1")
 

@@ -97,7 +97,7 @@ int main() {
 
     // 加载窗口图标
     GLFWimage images[1];
-    std::string image_icon = "../resources_gpu_v32/images/icon_ls.png";
+    std::string image_icon = "../resources_LifeGame_V2/images/icon_ls.png";
     images[0].pixels = stbi_load(image_icon.c_str(), &images[0].width, &images[0].height, 0, 4);
     if (images[0].pixels) {
         glfwSetWindowIcon(window, 1, images);
@@ -114,8 +114,8 @@ int main() {
     InitQuad(gl);//
     // 加载渲染着色器 (可视化)
     gl.renderProg = glCreateProgram();
-    std::string vsSrc = loadShaderFromFile("../resources_gpu_v32/shader/vs_code.vert");
-    std::string fsSrc = loadShaderFromFile("../resources_gpu_v32/shader/fs_code.frag");
+    std::string vsSrc = loadShaderFromFile("../resource_CUDA_V1/shader/vs_code.vert");
+    std::string fsSrc = loadShaderFromFile("../resource_CUDA_V1/shader/fs_code.frag");
     GLuint vs = createShader(vsSrc, GL_VERTEX_SHADER);
     GLuint fs = createShader(fsSrc, GL_FRAGMENT_SHADER);
     glAttachShader(gl.renderProg, vs);
@@ -185,12 +185,12 @@ int main() {
         ProcessInput(window, config, state, gl);//处理输入 (Input Processing)
         // 使用新的分发器渲染
 
-        RenderApp(state.currentScreen, state, info, winW, winH,  gl, g_loader);
+        RenderApp(state.currentScreen, state, info, winW, winH, gl, g_loader);
         state.isIntroMode = IsIntroScreen(state.currentScreen); // 同步状态
 
         // --- 渲染提交 ---
         ImGui::Render();
-        
+
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
         // 处理多视口 (如果 ImGui 开启了多窗口支持)

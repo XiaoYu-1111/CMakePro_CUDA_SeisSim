@@ -69,7 +69,7 @@ set_target_properties(${TARGET_NAME} PROPERTIES
 
 #解决cuda链接出错问题
 if (MSVC)
-    target_compile_options(CMakePro_CUDA PRIVATE
+    target_compile_options(${TARGET_NAME} PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:/FS>
     )
 endif()
