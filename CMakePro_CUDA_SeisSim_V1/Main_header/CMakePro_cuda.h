@@ -6,10 +6,10 @@
 #include <deque>
 #include <cmath>
 #include <algorithm>
+
+//自己编写的头文件
 #include "Common.h"
-
-
-#include "Cuda_Check.cuh"//cuda计算头文件
+#include"Seis_Sim.h"
 
 constexpr float PI = 3.14159265358979323846f;
 
@@ -411,18 +411,18 @@ void RenderIntroScreen0(SimState& state, int winW, int winH, bool& isIntroMode, 
             ImGui::Separator(); ImGui::Spacing();
             HubButton("AUTH_LOGO", "Initialize secure kernel handshake and identity verification nodes.", AppScreen::Intro1, IM_COL32(0, 255, 255, 180));
             HubButton("INTERFACE", "Neural-link topology and system-wide input mapping configuration.", AppScreen::Intro2, IM_COL32(0, 255, 255, 180));
-            HubButton("CORE_DIAG", "Real-time GPGPU throughput analysis and hardware health telemetry.", AppScreen::CudaDiagno, IM_COL32(0, 255, 255, 180));
-
+            
             ImGui::TableSetColumnIndex(1);
             ImGui::TextColored({ 0, 0.8f, 1, 0.8f }, ">> ANALYTICS.UNIT");
             ImGui::Separator(); ImGui::Spacing();
             HubButton("BIOME_HOST_CPU", "Heuristic cellular evolution via sequential x64 logic processing.", AppScreen::LifeGame, IM_COL32(0, 255, 255, 220));
             HubButton("BIOME_ACCEL_GPU", "Massively parallel biosphere synthesis utilizing CUDA tensor cores.", AppScreen::LifeGame2, IM_COL32(0, 255, 255, 220));
-
+            HubButton("SeisSim_GPU", "Massively parallel biosphere synthesis utilizing CUDA tensor cores.", AppScreen::SeisSim_GPU, IM_COL32(0, 255, 255, 220));
             ImGui::TableSetColumnIndex(2);
             ImGui::TextColored({ 0, 1, 0.6f, 1 }, ">> COMPUTE.ENGINES");
             ImGui::Separator(); ImGui::Spacing();
             HubButton("RF_STATION", "Multi-band RF signal interception and automated spectrum analysis.", AppScreen::HamStation, IM_COL32(0, 255, 255, 220));
+            HubButton("CORE_DIAG", "Real-time GPGPU throughput analysis and hardware health telemetry.", AppScreen::CudaDiagno, IM_COL32(0, 255, 255, 180));
 
             ImGui::EndTable();
         }
@@ -708,24 +708,6 @@ void RenderIntroScreen1(SimState& state, int winW, int winH, bool& isIntroMode, 
     ImGui::PopStyleVar(3);
 }
 
-struct SciParticle {
-    ImVec2 pos;
-    ImVec2 vel;
-    ImU32  color;
-    float  phase;
-    float  orbitSize;
-
-    static const int ABS_MAX_TRAIL = 2400;
-    ImVec2 trail[ABS_MAX_TRAIL];
-    int trail_ptr = 0;
-    int trail_count = 0;
-
-    void AddTrail(ImVec2 p) {
-        trail[trail_ptr] = p;
-        trail_ptr = (trail_ptr + 1) % ABS_MAX_TRAIL;
-        if (trail_count < ABS_MAX_TRAIL) trail_count++;
-    }
-};
 // 界面2,粒子路径变换
 void RenderIntroScreen2(SimState& state, int winW, int winH, bool& isIntroMode, AsyncLoader& loader) {
     float scale = (float)winW / 1920.0f;
@@ -2579,6 +2561,7 @@ void RenderCudaDiagnosticsScreen(SimState& state, const GpuInfo& info, int winW,
     ImGui::PopStyleColor(2); // 对应 WindowBg, Border
 }
 
+
 bool IsIntroScreen(AppScreen screen) {
     return (screen == AppScreen::Intro0 || screen == AppScreen::Intro1
         || screen == AppScreen::Intro2);
@@ -2607,6 +2590,10 @@ void RenderApp(AppScreen screen, SimState& state, const GpuInfo& info, int winW,
         break;
     case AppScreen::CudaDiagno:
         RenderCudaDiagnosticsScreen(state, info, winW, winH);
+        break;
+    case AppScreen::SeisSim_GPU:
+        // 调用我们下面实现的专业地震模拟渲染窗口
+        RenderSeisSimScreen_GPU(state, winW, winH, gl, info);
         break;
 
     default: break;
@@ -2715,19 +2702,35 @@ void cleanup(GLHandles& gl) {
 
 //处理键盘操作
 void ProcessInput(GLFWwindow* window, SimConfig& cfg, SimState& state, GLHandles& gl) {
+    // 只有在用户没有在任何 ImGui 文本框/输入框中编辑时，快捷键才起作用 (安全保护)
     if (!ImGui::GetIO().WantTextInput) {
+
+        // Tab 键：切换主菜单与模拟画面
         if (ImGui::IsKeyPressed(ImGuiKey_Tab, false)) {
             CycleScreens(state);
+        }
+
+        // =========================================================
+        // 【新增 1】：R 键重置视角信号发射
+        // =========================================================
+        if (ImGui::IsKeyPressed(ImGuiKey_R, false)) {
+            g_resetViewportRequested = true;
+        }
+
+        // =========================================================
+        // 【新增 2】：C 键重置模拟信号发射
+        // =========================================================
+        if (ImGui::IsKeyPressed(ImGuiKey_C, false)) {
+            g_resetSimRequested = true;
         }
     }
 
     // --- 空格键切换运行状态 ---
-    static bool spaceWasPressed = false; // 记录上一帧空格键是否按下
+    static bool spaceWasPressed = false;
     bool spaceIsPressed = (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS);
 
-    // 逻辑：当前按下且上一帧没按 -> 触发切换
     if (spaceIsPressed && !spaceWasPressed) {
         state.running = !state.running;
     }
-    spaceWasPressed = spaceIsPressed; // 更新状态
+    spaceWasPressed = spaceIsPressed;
 }

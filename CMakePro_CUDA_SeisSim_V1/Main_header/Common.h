@@ -23,9 +23,20 @@ enum class AppScreen {
     LifeGame2,       // 生命游戏gpu
     HamStation,
     CudaDiagno,
+    SeisSim_GPU,  // <-- 新增：CUDA 地震波场模拟屏
     Count
 };
-
+// 定义画笔类型枚举
+enum ToolMode {
+    TOOL_NONE = 0,   // 放置单点波源 (Source)
+    TOOL_HIGH = 1,  // 画笔：高速体
+    TOOL_LOW = 2,  // 画笔：低速体
+    TOOL_WALL = 3,  // 画笔：自定义
+    TOOL_ERASER = 4,// 画笔：橡皮擦
+    TOOL_ARRAY = 5,   // 工具：检波器阵列 (拖拽放置)
+    TOOL_RECT = 6,//填充材质
+    TOOL_RECT_SEL = 7//只绘制框
+};
 // ===================================================================
 // 2. 模拟与应用程序状态
 // ===================================================================
@@ -51,6 +62,11 @@ struct SimState {
     float idleTimeout = 60.0;       // 空闲超时阈值 (秒)
     double lastMouseX = 0.0;        // 鼠标X轴缓存
     double lastMouseY = 0.0;        // 鼠标Y轴缓存
+
+
+    // === 新增：画笔相关 ===
+    int brushType = TOOL_NONE; // 当前画笔模式
+    float brushRadius = 30.0f;  // 画笔半径 (像素)
 };
 
 // ===================================================================
@@ -94,6 +110,14 @@ struct GLHandles {
     int simW = 1920;
     int simH = 1080;
 
+    // --- 新增：地震模拟资源 ---
+    GLuint seisProg;       // <-- 新增：地震模拟专用着色器
+    //GLuint quadVAO;
+
+    GLuint seisTex;                 // 地震波场纹理
+    cudaGraphicsResource_t cudaSeisRes; // 用于地震的互操作资源
+    cudaArray_t cudaSeisArray;
+
 };
 
 // ===================================================================
@@ -115,6 +139,25 @@ struct AsyncLoader {
     std::mutex dataMutex;                 // 线程保护锁
 };
 
+
+struct SciParticle {
+    ImVec2 pos;
+    ImVec2 vel;
+    ImU32  color;
+    float  phase;
+    float  orbitSize;
+
+    static const int ABS_MAX_TRAIL = 2400;
+    ImVec2 trail[ABS_MAX_TRAIL];
+    int trail_ptr = 0;
+    int trail_count = 0;
+
+    void AddTrail(ImVec2 p) {
+        trail[trail_ptr] = p;
+        trail_ptr = (trail_ptr + 1) % ABS_MAX_TRAIL;
+        if (trail_count < ABS_MAX_TRAIL) trail_count++;
+    }
+};
 // ===================================================================
 // 6. 实体与基础结构
 // ===================================================================
@@ -169,35 +212,93 @@ inline GLuint createShader(const std::string& source, GLenum type) {
     return shader;
 }
 
-void InitQuad(GLHandles& gl) {
-    // 定义 4 个顶点：位置(x,y,z) + 纹理坐标(u,v)
-    float vertices[] = {
-        // 位置              // 纹理坐标
-        -1.0f,  1.0f, 0.0f,  0.0f, 1.0f,  // 左上
-        -1.0f, -1.0f, 0.0f,  0.0f, 0.0f,  // 左下
-         1.0f, -1.0f, 0.0f,  1.0f, 0.0f,  // 右下
+void InitQuad(GLHandles& gl);
 
-        -1.0f,  1.0f, 0.0f,  0.0f, 1.0f,  // 左上
-         1.0f, -1.0f, 0.0f,  1.0f, 0.0f,  // 右下
-         1.0f,  1.0f, 0.0f,  1.0f, 1.0f   // 右上
-    };
+#include <cmath>
 
-    glGenVertexArrays(1, &gl.quadVAO);
-    glGenBuffers(1, &gl.quadVBO);
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
 
-    glBindVertexArray(gl.quadVAO);
+struct Model {
+    int xnum = 500;
+    int znum = 500;
+    float dx = 1.0f;
+    float dz = 1.0f;
+};
 
-    glBindBuffer(GL_ARRAY_BUFFER, gl.quadVBO);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), &vertices, GL_STATIC_DRAW);
+struct Geometry {
+    float srcPace = 10.0f;
+    float rcvArray_inc = 10.0f;
+    float srcBegin = 2500.0f;
+    float srcZ = 20.0f;
+    float srcNumBegin = 1.0f;
+    float srcNumEnd = 1.0f;
+    float rcvPace = 10.0f;
+    float rcvBegin = 0.0f;
+    float rcvEnd = 5000.0f;
+    float rcvZ = 0.0f;
+};
 
-    // 位置属性 (Location 0)
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
+struct FDM {
+    float npml = 50.0f;
+    float xPace = 1.0f;
+    float zPace = 1.0f;
+    float f0 = 100.0f;
+    float t0 = 1 / f0;
+    float angle = 0.0f;
+    float srcFlag = 0.0f;
+    float dt = 0.000020f;
+    float nt = 10000.0f;
+    float snapPaceNum = 10.0f;
+    float decflag = 0.0f;
+    float correctionFlag = 0.0f;
+    float upFlag = 1.0f;
+    float dwnFlag = 1.0f;
+    float lfFlag = 1.0f;
+    float rtFlag = 1.0f;
+};
 
-    // 纹理坐标属性 (Location 1)
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
+struct Parameters {
+    Model model;
+    Geometry geom;
+    FDM FDM;
+};
 
-    glBindVertexArray(0);
-}
+struct SimulationContext {
+    int NX, NZ;
+    int total_grid;
+    float h, dt;
+    int nt, npml;
+    int snap_spacenum;
+    int flag_type; // 1, 2, 3
 
+    std::vector<float> rho, mu, lambda, lambda2mu;
+    std::vector<float> dp_flat;
+    std::vector<float> dx, dx_half, dz, dz_half;
+
+    float c1_h, c2_h, c3_h, c4_h;
+
+    int src_idx;
+    int src_z_idx;
+    std::vector<float> wavelet;
+    float src_angle;
+
+    int num_rcv;
+    std::vector<int> rcv_grid_idx;
+
+    std::vector<float> record_vx;
+    std::vector<float> record_vz;
+
+    bool upFlag;
+};
+
+// 视口基本信息结构体（用于适配 ImGui 绘图区域坐标）
+struct ViewportInfo {
+    float x = 0.0f; // 视口在屏幕上的绝对左边界
+    float y = 0.0f; // 视口在屏幕上的绝对上边界
+    float w = 1.0f; // 视口的宽度 (像素)
+    float h = 1.0f; // 视口的高度 (像素)
+    float scaleX = 1.0f; // 屏幕 X 像素 / 模拟 X 格数
+    float scaleY = 1.0f; // 屏幕 Y 像素 / 模拟 Z 格数
+};

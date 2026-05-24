@@ -17428,8 +17428,6 @@ void ImGui::DestroyPlatformWindows()
     for (ImGuiViewportP* viewport : g.Viewports)
         DestroyPlatformWindow(viewport);
 }
-
-
 //-----------------------------------------------------------------------------
 // [SECTION] DOCKING
 //-----------------------------------------------------------------------------

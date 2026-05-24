@@ -49,6 +49,131 @@
  // 主函数
  // =================================================================================
 
+static void glfw_error_callback(int error, const char* description) {
+    std::cerr << "Glfw Error " << error << ": " << description << std::endl;
+}
+// 简单的雷克子波产生器
+void generateRickerWavelet(std::vector<float>& wavelet, int nt, float dt, float f0, float t0) {
+    wavelet.resize(nt);
+    for (int i = 0; i < nt; ++i) {
+        float t = i * dt - t0;
+        float pi2_f0 = M_PI * M_PI * f0 * f0;
+        wavelet[i] = (1.0f - 2.0f * pi2_f0 * t * t) * expf(-pi2_f0 * t * t);
+    }
+}
+// 模拟测试上下文初始化
+void setupTestContext(SimulationContext& ctx, const Parameters& par) {
+    ctx.NX = par.model.xnum;
+    ctx.NZ = par.model.znum;
+    ctx.total_grid = ctx.NX * ctx.NZ;
+    ctx.dt = par.FDM.dt;
+    ctx.nt = static_cast<int>(par.FDM.nt);
+    ctx.npml = static_cast<int>(par.FDM.npml);
+    ctx.flag_type = 3; // 默认 Type 2
+    ctx.upFlag = (par.FDM.upFlag > 0.5f);
+
+    //ctx.c1_h = 1.125022f; ctx.c2_h = -0.04687594f; ctx.c3_h = 0.00416669f; ctx.c4_h = -0.00019234f;
+
+    // 这里以 par.model.dx 为准（或者 par.FDM.xPace，两者在物理上是一致的）
+    float h = par.model.dx;
+    if (h <= 0.0f) h = 1.0f; // 防呆保护
+    ctx.h = h;
+    // 将无单位的 8 阶有限差分系数除以空间步长 h 
+    // 数学原理：df/dx = [c1*(f1-f0) + c2*(f2-f-1) + ...] / h
+    ctx.c1_h = 1.125022f / h;
+    ctx.c2_h = -0.04687594f / h;
+    ctx.c3_h = 0.00416669f / h;
+    ctx.c4_h = -0.00019234f / h;
+
+    static float edit_Vp = 2000.0f;      // 默认纵波速度
+    static float edit_Vs = 1400.0f;       // 默认横波速度
+    static float edit_Density = 2000.0f; // 默认密度
+
+    // 1. 在后台自动转换为拉梅弹性常数
+    float mu_val = edit_Density * edit_Vs * edit_Vs;
+    float lambda2mu_val = edit_Density * edit_Vp * edit_Vp;
+    float lambda_val = lambda2mu_val - 2.0f * mu_val;
+
+    // 2. 重新填充本地 Context
+    ctx.rho.assign(ctx.total_grid, edit_Density);
+    ctx.mu.assign(ctx.total_grid, mu_val);
+    ctx.lambda.assign(ctx.total_grid, lambda_val);
+    ctx.lambda2mu.assign(ctx.total_grid, lambda2mu_val);
+
+    // PML 衰减系数初始化 (测试简化版，实际中采用余弦衰减)
+    ctx.dx.assign(ctx.NX, 0.0f); ctx.dx_half.assign(ctx.NX, 0.0f);
+    ctx.dz.assign(ctx.NZ, 0.0f); ctx.dz_half.assign(ctx.NZ, 0.0f);
+    for (int i = 0; i < ctx.npml; ++i) {
+        float val = 200.0f * powf((ctx.npml - i) / (float)ctx.npml, 2.0f);
+        ctx.dx[i] = val; ctx.dx[ctx.NX - 1 - i] = val;
+        ctx.dx_half[i] = val; ctx.dx_half[ctx.NX - 1 - i] = val;
+        ctx.dz[i] = val; ctx.dz[ctx.NZ - 1 - i] = val;
+        ctx.dz_half[i] = val; ctx.dz_half[ctx.NZ - 1 - i] = val;
+    }
+
+    //if (ctx.flag_type == 3) 
+    {
+        ctx.dp_flat.assign(ctx.NX, 0.0f);
+        int fs_idx = ctx.npml;
+        for (int j = 0; j < ctx.NX; ++j) {
+            int k = fs_idx * ctx.NX + j;
+            float l2m = ctx.lambda2mu[k];
+            float lam = ctx.lambda[k];
+            ctx.dp_flat[j] = (l2m * l2m - lam * lam) / l2m;
+        }
+    }
+
+    // 震源
+    ctx.src_idx = (ctx.NZ / 2) * ctx.NX + (ctx.NX / 2);
+    ctx.src_z_idx = ctx.NZ / 4;
+    ctx.src_angle = par.FDM.angle;
+    generateRickerWavelet(ctx.wavelet, ctx.nt, ctx.dt, par.FDM.f0, par.FDM.t0);
+
+    // 检波器 (中间水平放一行检波器)
+    ctx.num_rcv = 100;
+    ctx.rcv_grid_idx.resize(ctx.num_rcv);
+    int rcv_z = ctx.NZ / 2 + 30; // 震源下方 30 采样点
+    int step = ctx.NX / ctx.num_rcv;
+    for (int r = 0; r < ctx.num_rcv; ++r) {
+        ctx.rcv_grid_idx[r] = rcv_z * ctx.NX + (r * step);
+    }
+
+    ctx.record_vx.assign(ctx.num_rcv * ctx.nt, 0.0f);
+    ctx.record_vz.assign(ctx.num_rcv * ctx.nt, 0.0f);
+}
+
+void InitQuad(GLHandles& gl) {
+    // 定义 4 个顶点：位置(x,y,z) + 纹理坐标(u,v)
+    float vertices[] = {
+        // 位置              // 纹理坐标
+        -1.0f,  1.0f, 0.0f,  0.0f, 1.0f,  // 左上
+        -1.0f, -1.0f, 0.0f,  0.0f, 0.0f,  // 左下
+         1.0f, -1.0f, 0.0f,  1.0f, 0.0f,  // 右下
+
+        -1.0f,  1.0f, 0.0f,  0.0f, 1.0f,  // 左上
+         1.0f, -1.0f, 0.0f,  1.0f, 0.0f,  // 右下
+         1.0f,  1.0f, 0.0f,  1.0f, 1.0f   // 右上
+    };
+
+    glGenVertexArrays(1, &gl.quadVAO);
+    glGenBuffers(1, &gl.quadVBO);
+
+    glBindVertexArray(gl.quadVAO);
+
+    glBindBuffer(GL_ARRAY_BUFFER, gl.quadVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), &vertices, GL_STATIC_DRAW);
+
+    // 位置属性 (Location 0)
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
+
+    // 纹理坐标属性 (Location 1)
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
+
+    glBindVertexArray(0);
+}
+
 int main() {
 
     std::cout << "========= CUDA 硬件环境测试 =========" << std::endl;
@@ -84,7 +209,7 @@ int main() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow* window = glfwCreateWindow(config.winWidth, config.winHeight, "LifeGame_GPU 1.1.1", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(config.winWidth, config.winHeight, "CMakePro_CUDA_SeisSim_V1", nullptr, nullptr);
     if (!window) {
         glfwTerminate();
         return -1;
@@ -97,7 +222,7 @@ int main() {
 
     // 加载窗口图标
     GLFWimage images[1];
-    std::string image_icon = "../resources_LifeGame_V2/images/icon_ls.png";
+    std::string image_icon = "../resource_CUDA_V1/images/icon_Seis.png";
     images[0].pixels = stbi_load(image_icon.c_str(), &images[0].width, &images[0].height, 0, 4);
     if (images[0].pixels) {
         glfwSetWindowIcon(window, 1, images);
@@ -121,6 +246,19 @@ int main() {
     glAttachShader(gl.renderProg, vs);
     glAttachShader(gl.renderProg, fs);
     glLinkProgram(gl.renderProg);
+
+
+    // 1. 编译并加载地震专用着色器 [4]
+    gl.seisProg = glCreateProgram();
+    std::string seisVsSrc = loadShaderFromFile("../resource_CUDA_V1/shader/seis_code.vert");
+    std::string seisFsSrc = loadShaderFromFile("../resource_CUDA_V1/shader/seis_code.frag");
+    GLuint seisVs = createShader(seisVsSrc, GL_VERTEX_SHADER);
+    GLuint seisFs = createShader(seisFsSrc, GL_FRAGMENT_SHADER);
+    glAttachShader(gl.seisProg, seisVs);
+    glAttachShader(gl.seisProg, seisFs);
+    glLinkProgram(gl.seisProg);
+
+    glDeleteShader(seisFs); // 链接后可安全删除临时 shader 句柄
 
 
     // 在 gl.renderProg 链接之后
