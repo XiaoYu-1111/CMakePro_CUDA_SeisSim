@@ -112,8 +112,6 @@ struct GLHandles {
 
     // --- 新增：地震模拟资源 ---
     GLuint seisProg;       // <-- 新增：地震模拟专用着色器
-    //GLuint quadVAO;
-
     GLuint seisTex;                 // 地震波场纹理
     cudaGraphicsResource_t cudaSeisRes; // 用于地震的互操作资源
     cudaArray_t cudaSeisArray;
@@ -309,4 +307,21 @@ struct GPUSource {
     float t;       // 当前震源已传播的物理时间 (秒)
     float f_peak;  // 震源的主频 f0
     float amp;     // 震源的振幅
+};
+
+// =============================================================================
+// 1. 场景预设枚举与全局 inline 持久化变量 (C++20 标准)
+// =============================================================================
+enum SceneType {
+    SCENE_UNIFORM = 0,         // 均匀介质 (Default)
+    SCENE_EARTH,               // 地球分层模型 (含液态外核横波消失现象)
+    SCENE_DOUBLE_SLIT,         // 双缝干涉
+    SCENE_TWO_LAYER,           // 双层介质分界面
+    SCENE_WAVEGUIDE,           // 直波导通道
+    SCENE_WAVEGUIDE_CURVED,    // 弯曲波导通道
+    SCENE_CRYSTAL,             // 六角格声子晶体
+    SCENE_RANDOM_SCATTER,      // 随机散射介质 (300个气泡)
+    SCENE_CURVED,              // 起伏分界面 (正弦层位)
+    SCENE_REFRACTION,          // 线性连续速度梯度 (折射回转波)
+    SCENE_PENROSE_ROOM         // 彭罗斯椭圆房间 (波场双焦收敛)
 };

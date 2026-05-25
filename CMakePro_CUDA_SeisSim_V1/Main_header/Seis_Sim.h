@@ -1,29 +1,109 @@
 #pragma once
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <cmath>
+
+// =================================================================================
+// 1. 平台相关定义与系统头文件 (Platform Specifics)
+// =================================================================================
+#ifdef _WIN32
+#define NOMINMAX          // 必须放在 windows.h 之前，禁用 min/max 宏，避免与 std::min/max 冲突
+#include <windows.h>      // Windows API
+#include <direct.h>       // _mkdir
+#include <io.h>           // _access
+#else
+#include <sys/stat.h>     // mkdir
+#include <sys/types.h>
+#include <unistd.h>
+#endif
 
 #include "Common.h"
-#include "Cuda_Check.cuh"//cuda计算头文件
+#include "Cuda_Check.cuh" // CUDA计算头文件
+#include "SeismicIO.h"
 
 
-/// 声明外部已经配置好的全局或静态计算上下文（用于连接我们之前的 FDM CUDA 逻辑）
+// 声明外部未绑定的 FDM 主机端物理配置函数
+extern "C" {
+    void setupTestContext(SimulationContext& ctx, const Parameters& par);
+    void generateRickerWavelet(std::vector<float>& wavelet, int nt, float dt, float f0, float t0);
+}
+
+// =============================================================================
+// 1. C++20 文件级全局持久化状态控制变量 (Header-Safe inline)
+// =============================================================================
 static SimulationContext ctx;
 static GPUSimData gpu_data;
 static bool is_seis_initialized = false;
 
-// =============================================================================
-// C++20 共享全局信号（用于连接键盘快捷键与屏幕渲染器的物理重置行为）
-// =============================================================================
+// 全局控制信号
 inline bool g_resetSimRequested = false;      // C 键重置模拟信号
 inline bool g_resetViewportRequested = false;  // R 键重置视口信号
 
-void setupTestContext(SimulationContext& ctx, const Parameters& par);
+// --- 物理与网格大小控制 ---
+inline int edit_w = 1000;
+inline int edit_h = 500;
+inline float edit_f0 = 100.0f;
+inline float edit_t0 = 1/edit_f0;
 
-void generateRickerWavelet(std::vector<float>& wavelet, int nt, float dt, float f0, float t0);
+// --- 时间演化与渲染属性 ---
+inline int current_it = 0;
+inline float accumulated_compute_time = 0.0f;
+inline float color_scale = 10.0f;
+inline int show_component = 0; // 0: Vz, 1: Vx
+inline int steps_per_frame = 10;
+inline bool showHUD = true;
+inline int waveStyle = 0; // 默认采用 Style 0: Magma Glow
+
+// --- 物理震源位置与受力角度 ---
+inline int edit_src_x = 500;
+inline int edit_src_z = 125;
+inline float edit_angle = 0.0f;
+
+// --- 视口平移与滚轮缩放 ---
+inline float viewZoom = 1.0f;
+inline ImVec2 viewOffset = { 0.0f, 0.0f };
+inline bool first_align_needed = false;
+inline Parameters par;
+
+// --- 动态多震源与无限模式 ---
+inline bool multi_source_mode = false;
+inline std::vector<GPUSource> active_sources;
+inline bool infinite_mode = false;
+
+// --- 鼠标悬停实时监控数据 ---
+inline int hover_mx = 0;
+inline int hover_my = 0;
+inline float hover_Vp = 0.0f;
+inline float hover_Vs = 0.0f;
+inline float hover_Rho = 0.0f;
+inline bool hover_valid = false;
+
+// --- 全局 UI 荧光主题色 (默认绿色荧光) ---
+inline ImVec4 uiAccent = ImVec4(0.5f, 1.0f, 0.5f, 1.0f);
+
+inline bool is_mouse_inside = false;
+
+inline int modelStyle = 0; // 0: 钛金灰, 1: 科学地质图, 2: 灰度Vp, 3: Viridis, 4: Cyber
+inline int current_scene = SCENE_UNIFORM; // 当前加载的物理场景
 
 // =============================================================================
-// 精英版：随 Backbuffer 物理画面【同步移动、缩放、自适应间距】的动态标尺
+// 【核心新增】：将 Vp、Vs、Density 提升至全局 inline，彻底解决参数在重算时回滚的 Bug [3]
 // =============================================================================
+inline float edit_Vp = 2000.0f;      // 全局共享：纵波速度
+inline float edit_Vs = 1400.0f;      // 全局共享：横波速度
+inline float edit_Density = 2000.0f; // 全局共享：密度
+
+inline GLuint g_modelTex = 0; // 离屏地质物性纹理句柄
+
+inline bool showGrid = true; // 默认开启背景网格与矩阵点显示
+
+inline static bool show_success_popup = false;
+inline static bool show_error_popup = false;
+inline static std::string popup_message="";
+
 // =============================================================================
-// 精英修正版：解决 2 倍尺度和速度漂移 Bug，实现标尺与波场 100% 绝对物理咬合
+// 2. 标尺绘制模块 (Symmetric Titanium Background 风格自适应物理标尺)
 // =============================================================================
 inline void RenderGridRulerOnBackbuffer(
     const SimulationContext& ctx,
@@ -37,7 +117,6 @@ inline void RenderGridRulerOnBackbuffer(
     ImU32 textCol = IM_COL32(220, 220, 220, 225); // 荧光白
     ImU32 tickCol = IM_COL32(0, 255, 200, 100);   // 青色刻度线
 
-    // 1. 计算宽高比校正系数 (与着色器完全一致)
     float winAspect = (float)winW / (float)winH;
     float simAspect = (float)ctx.NX / (float)ctx.NZ;
     ImVec2 aspectCorr = { 1.0f, 1.0f };
@@ -48,7 +127,7 @@ inline void RenderGridRulerOnBackbuffer(
         aspectCorr.y = simAspect / winAspect;
     }
 
-    // 2. 自适应间距自调节 [1.2.7]
+    // 根据当前的缩放比动态调节刻度的间距，防止文字重叠 [1.2.7]
     float spacing = 50.0f;
     if (viewZoom < 0.35f)  spacing = 100.0f;
     if (viewZoom < 0.15f)  spacing = 200.0f;
@@ -57,23 +136,14 @@ inline void RenderGridRulerOnBackbuffer(
     if (viewZoom > 5.0f)   spacing = 10.0f;
     if (viewZoom > 12.0f)  spacing = 5.0f;
 
-    // ========================================================
     // A. 绘制顶部 X 轴物理刻度 (100% 像素级对齐)
-    // ========================================================
     for (float simX = 0.0f; simX <= ctx.NX; simX += spacing) {
-
-        // 1. 【数学修复】：将格数 simX 先映射到顶点空间的 [-1.0, 1.0] (完美对应 aPos.x)
         float aPos_x = (simX / (float)ctx.NX) * 2.0f - 1.0f;
-
-        // 2. 完美的顶点着色器前向矩阵投影公式
         float Pndc_x = (aPos_x - viewOffset.x) * viewZoom / aspectCorr.x;
-
-        // 3. 将 NDC 坐标线性转换回屏幕实际像素坐标 [1.2.7]
         float screenX = (Pndc_x * 0.5f + 0.5f) * winW;
 
         if (screenX >= 0.0f && screenX <= winW) {
             float screenY = barHeight + 2.0f;
-
             draw_list->AddLine(ImVec2(screenX, screenY), ImVec2(screenX, screenY + 6.0f), tickCol, 1.5f);
 
             float physVal = simX * ctx.h;
@@ -89,23 +159,14 @@ inline void RenderGridRulerOnBackbuffer(
         }
     }
 
-    // ========================================================
     // B. 绘制左侧 Y 轴物理深度刻度 (100% 像素级对齐)
-    // ========================================================
     for (float simY = 0.0f; simY <= ctx.NZ; simY += spacing) {
-
-        // 1. 【数学修复】：将物理深度 simY 映射到顶点空间（地表 Y 轴翻转，0 刻度对应 1.0）
         float aPos_y = 1.0f - (simY / (float)ctx.NZ) * 2.0f;
-
-        // 2. 矩阵投影公式
         float Pndc_y = (aPos_y - viewOffset.y) * viewZoom / aspectCorr.y;
-
-        // 3. 转回屏幕像素坐标 (ImGui 中 0 在最顶端，1.0 在最底端) [1.2.7]
         float screenY = (0.5f - Pndc_y * 0.5f) * winH;
 
         if (screenY >= barHeight && screenY <= winH) {
             float screenX = 4.0f;
-
             draw_list->AddLine(ImVec2(screenX, screenY), ImVec2(screenX + 6.0f, screenY), tickCol, 1.5f);
 
             float physVal = simY * ctx.h;
@@ -120,25 +181,22 @@ inline void RenderGridRulerOnBackbuffer(
         }
     }
 }
+
 // =============================================================================
-// 2. 移植版：星空/科技主题鼠标画笔光标渲染
+// 3. 移植版：星空/科技主题鼠标画笔光标渲染
 // =============================================================================
-void RenderBrushCursor(const SimState& state, const ViewportInfo& vp) {
+inline void RenderBrushCursor(const SimState& state, const ViewportInfo& vp) {
     ImVec2 mousePos = ImGui::GetMousePos();
     bool isInside = (mousePos.x >= vp.x && mousePos.x < (vp.x + vp.w) &&
         mousePos.y >= vp.y && mousePos.y < (vp.y + vp.h));
 
-    // 如果鼠标正在操作 UI（比如点悬浮面板），则不渲染自定义光标
     if (ImGui::GetIO().WantCaptureMouse) return;
 
     if (isInside) {
         ImDrawList* fg = ImGui::GetForegroundDrawList();
 
-        // 如果没有选择任何画笔（TOOL_NONE），绘制科技感十足的准星
-        // 注：若您的 SimState 中没有 brushType，可以直接保留 TOOL_NONE 分支作为炫酷的默认准星
         if (state.brushType == TOOL_NONE) {
             float t = (float)ImGui::GetTime();
-
             const float crosshairSize = 18.0f;
             const float outerRingRadius = 35.0f;
 
@@ -146,23 +204,19 @@ void RenderBrushCursor(const SimState& state, const ViewportInfo& vp) {
             ImU32 col_dynamic = IM_COL32(255, 230, 51, 255);    // 荧光黄
             ImU32 col_shadow = IM_COL32(13, 20, 56, 150);
 
-            // A. 绘制十字线阴影与亮线
             fg->AddLine(ImVec2(mousePos.x - crosshairSize, mousePos.y), ImVec2(mousePos.x + crosshairSize, mousePos.y), col_shadow, 4.0f);
             fg->AddLine(ImVec2(mousePos.x, mousePos.y - crosshairSize), ImVec2(mousePos.x, mousePos.y + crosshairSize), col_shadow, 4.0f);
             fg->AddLine(ImVec2(mousePos.x - crosshairSize, mousePos.y), ImVec2(mousePos.x + crosshairSize, mousePos.y), col_main, 2.0f);
             fg->AddLine(ImVec2(mousePos.x, mousePos.y - crosshairSize), ImVec2(mousePos.x, mousePos.y + crosshairSize), col_main, 2.0f);
 
-            // B. 静态外环
             fg->AddCircle(mousePos, outerRingRadius, col_main, 32, 1.5f);
 
-            // C. 动态雷达扫描线
             float angle = t * 4.0f;
             ImVec2 scanEnd = ImVec2(mousePos.x + cos(angle) * outerRingRadius,
                 mousePos.y + sin(angle) * outerRingRadius);
             fg->AddLine(mousePos, scanEnd, col_dynamic, 2.0f);
             fg->AddCircleFilled(scanEnd, 3.5f, col_dynamic);
 
-            // D. 脉冲扩散光环
             float pulse_t = fmodf(t, 1.5f) / 1.5f;
             float pulse_radius = pulse_t * outerRingRadius;
             int pulse_alpha = (int)(sin(pulse_t * 3.14159f) * 120);
@@ -170,19 +224,16 @@ void RenderBrushCursor(const SimState& state, const ViewportInfo& vp) {
             fg->AddCircle(mousePos, pulse_radius, col_pulse, 32, 3.0f);
         }
         else {
-            // 画笔激活状态 (TOOL_HIGH, TOOL_LOW, TOOL_WALL, TOOL_ERASER)
             ImU32 brushColor;
             switch (state.brushType) {
-            case TOOL_HIGH:   brushColor = IM_COL32(255, 100, 100, 200); break; // 红色代表高波速
-            case TOOL_LOW:    brushColor = IM_COL32(100, 150, 255, 200); break; // 蓝色代表低波速
-            case TOOL_WALL:   brushColor = IM_COL32(255, 255, 0, 200);   break; // 黄色代表反射障壁
-            case TOOL_ERASER: brushColor = IM_COL32(200, 200, 200, 200); break; // 灰色代表橡皮擦
+            case TOOL_HIGH:   brushColor = IM_COL32(255, 100, 100, 200); break;
+            case TOOL_LOW:    brushColor = IM_COL32(100, 150, 255, 200); break;
+            case TOOL_WALL:   brushColor = IM_COL32(255, 255, 0, 200);   break;
+            case TOOL_ERASER: brushColor = IM_COL32(200, 200, 200, 200); break;
             default:          brushColor = IM_COL32(255, 255, 255, 200); break;
             }
 
-            // 根据当前缩放比例动态缩放画笔圆圈的实际显示尺寸
             float screenRadius = state.brushRadius * vp.scaleX;
-
             fg->AddCircle(mousePos, screenRadius, brushColor, 0, 2.0f);
             fg->AddCircle(mousePos, screenRadius - 1.0f, IM_COL32(0, 0, 0, 150), 0, 1.0f);
             fg->AddCircleFilled(mousePos, 3.0f, IM_COL32(255, 255, 255, 255));
@@ -191,7 +242,7 @@ void RenderBrushCursor(const SimState& state, const ViewportInfo& vp) {
 }
 
 // =============================================================================
-// 新增：高精度随背景平移缩放、无漂移的物理震源准星 (Orange Crosshair)
+// 4. 新增：高精度随背景平移缩放、无漂移的物理震源准星 (Orange Crosshair)
 // =============================================================================
 inline void RenderSourceMarker(
     const SimulationContext& ctx,
@@ -201,7 +252,6 @@ inline void RenderSourceMarker(
     const ImVec2& viewOffset,
     float viewZoom
 ) {
-    // 1. 计算宽高比校正系数 (与着色器完全一致)
     float winAspect = (float)winW / (float)winH;
     float simAspect = (float)ctx.NX / (float)ctx.NZ;
     ImVec2 aspectCorr = { 1.0f, 1.0f };
@@ -212,121 +262,766 @@ inline void RenderSourceMarker(
         aspectCorr.y = simAspect / winAspect;
     }
 
-    // 2. 将格数 (src_x, src_z) 转换到顶点坐标空间的 [-1.0, 1.0] [1.1.3]
     float aPos_x = ((float)src_x / (float)ctx.NX) * 2.0f - 1.0f;
-    float aPos_y = 1.0f - ((float)src_z / (float)ctx.NZ) * 2.0f; // 垂直 Y 轴翻转
+    float aPos_y = 1.0f - ((float)src_z / (float)ctx.NZ) * 2.0f;
 
-    // 3. 计算 NDC 与屏幕像素坐标
     float Pndc_x = (aPos_x - viewOffset.x) * viewZoom / aspectCorr.x;
     float screenX = (Pndc_x * 0.5f + 0.5f) * winW;
 
     float Pndc_y = (aPos_y - viewOffset.y) * viewZoom / aspectCorr.y;
     float screenY = (0.5f - Pndc_y * 0.5f) * winH;
 
-    // 4. 安全范围裁剪 (只在可见视口内且在 TopBar 下方时绘制) [1.2.7]
     if (screenX >= 0.0f && screenX <= winW && screenY >= barHeight && screenY <= winH) {
         ImDrawList* fg = ImGui::GetForegroundDrawList();
         ImVec2 pos(screenX, screenY);
 
-        // 准星样式配置
-        ImU32 colMain = IM_COL32(125, 255,125, 255); // 亮橙
-        ImU32 colBlack = IM_COL32(0, 0, 0, 180);    // 黑色阴影
-        float lineLen = 20.0f;                      // 十字臂长
-        float gap = 3.0f;                           // 中心留空（保护视线）
+        ImU32 colMain = IM_COL32(125, 255, 125, 255);
+        ImU32 colBlack = IM_COL32(0, 0, 0, 180);
+        float lineLen = 20.0f;
+        float gap = 3.0f;
 
-        // A. 绘制十字准星阴影
         fg->AddLine(ImVec2(pos.x - lineLen, pos.y), ImVec2(pos.x + lineLen, pos.y), colBlack, 3.5f);
         fg->AddLine(ImVec2(pos.x, pos.y - lineLen), ImVec2(pos.x, pos.y + lineLen), colBlack, 3.5f);
 
-        // B. 绘制亮橙色十字线
         fg->AddLine(ImVec2(pos.x - lineLen, pos.y), ImVec2(pos.x - gap, pos.y), colMain, 1.5f);
         fg->AddLine(ImVec2(pos.x + gap, pos.y), ImVec2(pos.x + lineLen, pos.y), colMain, 1.5f);
         fg->AddLine(ImVec2(pos.x, pos.y - lineLen), ImVec2(pos.x, pos.y - gap), colMain, 1.5f);
         fg->AddLine(ImVec2(pos.x, pos.y + gap), ImVec2(pos.x, pos.y + lineLen), colMain, 1.5f);
 
-        // C. 绘制网格及物理距离文字 (例: 500, 250 (500m, 250m))
         char buf[64];
         snprintf(buf, 64, "%d, %d (%.0fm, %.0fm)", src_x, src_z, src_x * ctx.h, src_z * ctx.h);
 
         ImVec2 textPos = ImVec2(pos.x + 8, pos.y + 8);
-        fg->AddText(ImVec2(textPos.x + 1, textPos.y + 1), colBlack, buf); // 阴影
-        fg->AddText(textPos, colMain, buf);                              // 橙字
+        fg->AddText(ImVec2(textPos.x + 1, textPos.y + 1), colBlack, buf);
+        fg->AddText(textPos, colMain, buf);
 
-        // D. 呼吸圆环
         float t = (float)ImGui::GetTime();
         float pulse = (sin(t * 3.0f) * 0.5f + 0.5f) * 5.0f;
         fg->AddCircle(pos, 5.0f + pulse, IM_COL32(125, 255, 125, 155), 16, 1.0f);
     }
 }
 
-void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl, const GpuInfo& info) {
-    ImGuiIO& io = ImGui::GetIO();
-    const float scale = (float)winW / 1920.0f;
-    const float barHeight = 48.0f * scale; // 状态栏高度
+// =============================================================================
+// 2. 核心物性注入器：将 Vp、Vs、密度转换为 CPU 端弹性拉梅常数
+// =============================================================================
+inline void SetMaterialAt(int x, int y, float vp, float vs, float rho) {
+    /*int k = y * ctx.NX + x;
+    if (k >= 0 && k < ctx.total_grid) {
+        ctx.rho[k] = rho;
+        ctx.mu[k] = rho * vs * vs;
+        ctx.lambda2mu[k] = rho * vp * vp;
+        ctx.lambda[k] = ctx.lambda2mu[k] - 2.0f * ctx.mu[k];
+    }*/
+    // 核心修复：将 y 进行垂直镜像，使 LoadScenario 的 y=0 对应 CUDA 网格的最底层 (NZ - 1 - y)
+    int k = (ctx.NZ - 1 - y) * ctx.NX + x;
+    if (k >= 0 && k < ctx.total_grid) {
+        ctx.rho[k] = rho;
+        ctx.mu[k] = rho * vs * vs;
+        ctx.lambda2mu[k] = rho * vp * vp;
+        ctx.lambda[k] = ctx.lambda2mu[k] - 2.0f * ctx.mu[k];
+    }
+}
 
-    // 【修改】：网格尺寸调节静态变量 (默认 1000 x 500)
-    static int edit_w = 1000;
-    static int edit_h = 500;
+// =============================================================================
+// 3. 场景装载器：完美适配 11 套高维地球物理仿真场景
+// =============================================================================
+inline void LoadScenario(int type) {
+    int W = ctx.NX;
+    int H = ctx.NZ;
 
-    // 【新增】：子波主频 (f0) 与时间延迟 (t0) 的持久化变量，默认对齐启动参数
-    static float edit_f0 = 100.0f;
-    static float edit_t0 = 1 / edit_f0;
+    // 默认背景常数 (硬砂岩)
+    float defVp = 3000.0f, defVs = 1732.0f, defRho = 2200.0f;
 
-    // --- [1. 初始化地震模拟上下文与 GPU 显存] ---
-    // --- [ 1. 初始化地震数据与纹理 ] ---
-    static bool first_align_needed = false; // 用于标记是否需要执行首次对齐
-    static Parameters par; // 使用您默认的参数
+    // 默认背景填充
+    for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < W; ++x) {
+            SetMaterialAt(x, y, defVp, defVs, defRho);
+        }
+    }
+
+    // 默认激发位置重定位
+    edit_src_x = W / 2;
+    edit_src_z = H / 2;
+
+    if (type == SCENE_EARTH) {
+        // 地核地幔分层模型 (展示液态铁外核横波 Vs=0 消失与 P 波透射物理现象)
+        int cx = W / 2;
+        int cy = H / 2;
+        float maxRadius = (std::min(W, H) / 2.0f) * 0.95f;
+        float r_core = maxRadius * 0.54f;
+        float r_mantle = maxRadius * 0.92f;
+
+        float r_core_sq = r_core * r_core;
+        float r_mantle_sq = r_mantle * r_mantle;
+        float max_sq = maxRadius * maxRadius;
+
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                float dx = (float)(x - cx);
+                float dy = (float)(y - cy);
+                float distSq = dx * dx + dy * dy;
+
+                if (distSq < r_core_sq) {
+                    SetMaterialAt(x, y, 4000.0f, 0.0f, 4000.0f); // 液态地核：Vs=0
+                }
+                else if (distSq < r_mantle_sq) {
+                    SetMaterialAt(x, y, 6000.0f, 3400.0f, 3000.0f); // 固体地幔
+                }
+                else if (distSq < max_sq) {
+                    SetMaterialAt(x, y, 3000.0f, 1700.0f, 2500.0f); // 地壳
+                }
+                else {
+                    SetMaterialAt(x, y, 340.0f, 10.0f, 100.0f);     // 外部低速介质
+                }
+            }
+        }
+        edit_src_x = W / 2; edit_src_z = H / 2;
+    }
+    else if (type == SCENE_DOUBLE_SLIT) {
+        // 水中高阻抗双缝挡板干涉场景
+        int cy = H / 2;
+        int cx = W / 2;
+        int wallX = cx;
+
+        // 水介质背景 (Vp=1500, Vs=0)
+        for (int i = 0; i < W * H; i++) {
+            SetMaterialAt(i % W, i / W, 1500.0f, 0.0f, 1000.0f);
+        }
+
+        // 高阻抗墙体屏障 (厚10格) 与双缝
+        for (int y = 0; y < H; ++y) {
+            bool isSlit = (abs(y - cy) > 30 && abs(y - cy) < 60);
+            if (!isSlit) {
+                for (int w = 0; w < 10; w++) {
+                    SetMaterialAt(wallX + w, y, 5500.0f, 3200.0f, 8000.0f); // 高速致密钢质屏障
+                }
+            }
+        }
+        edit_src_x = W / 4; edit_src_z = cy;
+    }
+    else if (type == SCENE_TWO_LAYER) {
+        // 典型双层层状介质模型
+        int interfaceY = H / 2;
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                if (y < interfaceY) {
+                    SetMaterialAt(x, y, 4000.0f, 2300.0f, 2500.0f); // 深部硬岩
+                }
+                else {
+                    SetMaterialAt(x, y, 2000.0f, 1100.0f, 1500.0f); // 浅部软岩
+                }
+            }
+        }
+        edit_src_x = W / 2; edit_src_z = H / 2 + 50;
+    }
+    else if (type == SCENE_WAVEGUIDE) {
+        // 直条状低速波导通道 (能量在其中全反射限制传播)
+        int cy = H / 2;
+        int guideHalfWidth = 60;
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                if (abs(y - cy) < guideHalfWidth) {
+                    SetMaterialAt(x, y, 2000.0f, 1000.0f, 1500.0f); // 低速芯层
+                }
+                else {
+                    SetMaterialAt(x, y,100.0f, 60.0f,10000.0f); // 低包层
+                }
+            }
+        }
+        edit_src_x = 100; edit_src_z = cy;
+    }
+    else if (type == SCENE_WAVEGUIDE_CURVED) {
+        // 正弦曲线型弯曲高速波导
+        int cy = H / 2;
+        int guideHalfWidth = 60;
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                float currentCenterY = (H / 2) + (H / 4) * sin((float)x / W * 2.0f * 3.14159f);
+                if (abs(y - currentCenterY) < guideHalfWidth) {
+                    SetMaterialAt(x, y, 2000.0f, 1000.0f, 1500.0f);
+                }
+                else {
+                    SetMaterialAt(x, y, 5500.0f, 3200.0f, 3000.0f);
+                }
+            }
+        }
+        edit_src_x = 100; edit_src_z = H / 2;
+    }
+    else if (type == SCENE_CRYSTAL) {
+        // 晶体交错六角声子晶格 (钢球格栅阻碍与干涉波前)
+        float bgVp = 1500.0f, bgVs = 0.0f, bgRho = 1000.0f;       // 水背景
+        float scVp = 5800.0f, scVs = 3200.0f, scRho = 7800.0f;    // 钢球
+        int radius = 12, spacingX = 50, spacingY = 50;
+        int startX = 250, endX = W - 100, startY = 100, endY = H - 100;
+
+        for (int i = 0; i < W * H; ++i) SetMaterialAt(i % W, i / W, bgVp, bgVs, bgRho);
+
+        int cols = (endX - startX) / spacingX;
+        int rows = (endY - startY) / spacingY;
+        float r2 = (float)(radius * radius);
+
+        for (int j = 0; j < rows; ++j) {
+            for (int i = 0; i < cols; ++i) {
+                int cx = startX + i * spacingX;
+                int cy = startY + j * spacingY;
+                if (j % 2 == 1) cx += spacingX / 2; // 蜂窝交错
+
+                for (int y = cy - radius; y <= cy + radius; ++y) {
+                    for (int x = cx - radius; x <= cx + radius; ++x) {
+                        if (x >= 0 && x < W && y >= 0 && y < H) {
+                            float dx = (float)(x - cx); float dy = (float)(y - cy);
+                            if (dx * dx + dy * dy <= r2) {
+                                SetMaterialAt(x, y, scVp, scVs, scRho);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        edit_src_x = 100; edit_src_z = H / 2;
+    }
+    else if (type == SCENE_RANDOM_SCATTER) {
+        // 随机泡泡介质强散射场
+        float bgVp = 2500.0f, bgVs = 1200.0f, bgRho = 2000.0f;
+        float scVp = 4500.0f, scVs = 2500.0f, scRho = 2800.0f;
+
+        for (int i = 0; i < W * H; ++i) SetMaterialAt(i % W, i / W, bgVp, bgVs, bgRho);
+
+        int numScatterers = 300;
+        int minR = 5, maxR = 15;
+        for (int k = 0; k < numScatterers; ++k) {
+            int cx = rand() % (W - 100) + 50;
+            int cy = rand() % (H - 100) + 50;
+            int r = rand() % (maxR - minR) + minR;
+            float r2 = (float)(r * r);
+
+            for (int y = cy - r; y <= cy + r; ++y) {
+                for (int x = cx - r; x <= cx + r; ++x) {
+                    if (x >= 0 && x < W && y >= 0 && y < H) {
+                        float dx = x - cx; float dy = y - cy;
+                        if (dx * dx + dy * dy <= r2) SetMaterialAt(x, y, scVp, scVs, scRho);
+                    }
+                }
+            }
+        }
+        edit_src_x = W / 2; edit_src_z = H / 2;
+    }
+    else if (type == SCENE_CURVED) {
+        // 起伏正弦两层介质分界面
+        float l1_Vp = 2000.0f, l1_Vs = 1100.0f, l1_Rho = 1800.0f;
+        float l2_Vp = 3500.0f, l2_Vs = 2000.0f, l2_Rho = 2400.0f;
+        float l3_Vp = 5500.0f, l3_Vs = 3200.0f, l3_Rho = 2800.0f;
+
+        float baseH1 = H * 0.35f, amp1 = H * 0.08f, freq1 = 2.0f * 3.14159f / W * 2.5f;
+        float baseH2 = H * 0.65f, amp2 = H * 0.05f, freq2 = 2.0f * 3.14159f / W * 1.5f, phase2 = 1.0f;
+
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                float h1 = baseH1 + amp1 * sin(x * freq1);
+                float h2 = baseH2 + amp2 * sin(x * freq2 + phase2);
+                if (y < h1)       SetMaterialAt(x, y, l3_Vp, l3_Vs, l3_Rho);
+                else if (y < h2)  SetMaterialAt(x, y, l2_Vp, l2_Vs, l2_Rho);
+                else              SetMaterialAt(x, y, l1_Vp, l1_Vs, l1_Rho);
+            }
+        }
+        edit_src_x = W / 2; edit_src_z = H - 50;
+    }
+    else if (type == SCENE_REFRACTION) {
+        // 速度连续线性增加的梯度介质 (折射和回转回弹波)
+        float vTop = 2000.0f, vBot = 5500.0f, rhoTop = 1800.0f, rhoBot = 3000.0f;
+        for (int y = 0; y < H; ++y) {
+            float ratio = (float)y / (float)H;
+            float vp = vBot + (vTop - vBot) * ratio;
+            float vs = vp / 1.732f;
+            if (vp < 1600.0f) vs = 0.0f;
+            float rho = rhoBot + (rhoTop - rhoBot) * ratio;
+
+            for (int x = 0; x < W; ++x) SetMaterialAt(x, y, vp, vs, rho);
+        }
+        edit_src_x = 100; edit_src_z = H - 50; // 浅层激发
+    }
+    else if (type == SCENE_PENROSE_ROOM) {
+        // 彭罗斯椭圆房间 (展示波形双焦点汇聚透镜效应)
+        float rockVp = 3000.0f, rockVs = 1732.0f, rockRho = 2500.0f;
+        float airVp = 0.0f, airVs = 0.0f, airRho = 20.0f;
+        float cx = W * 0.5f, cy = H * 0.5f;
+        float s = std::min(W, H) * 0.38f;
+
+        auto isInsidePenrose = [&](float px, float py) -> bool {
+            float x = (px - cx) / s; float y = (py - cy) / s;
+            float room_half_width = 1.5f;
+            bool top = (y < -0.4f) && ((x * x) / (room_half_width * room_half_width) + pow((y + 0.4f) / 0.7f, 2) <= 1.0f);
+            bool bottom = (y > 0.4f) && ((x * x) / (room_half_width * room_half_width) + pow((y - 0.4f) / 0.7f, 2) <= 1.0f);
+            bool middle_rect = (abs(y) <= 0.4f) && (abs(x) <= room_half_width);
+            bool room_base = top || bottom || middle_rect;
+
+            float mush_pos_x = 1.3f;
+            auto is_mushroom = [&](float mx, float my) -> bool {
+                bool cap = (mx > 0.0f) && (my * my / 0.16f + mx * mx / 0.09f <= 1.0f);
+                bool stem = (mx <= 0.0f) && (abs(my) <= 0.08f) && (mx > -0.6f);
+                return cap || stem;
+                };
+            bool left_mushroom = is_mushroom(x - (-mush_pos_x), y);
+            bool right_mushroom = is_mushroom(-(x - mush_pos_x), y);
+            return room_base && !left_mushroom && !right_mushroom;
+            };
+
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                if (isInsidePenrose((float)x, (float)y)) SetMaterialAt(x, y, rockVp, rockVs, rockRho);
+                else                                     SetMaterialAt(x, y, airVp, airVs, airRho);
+            }
+        }
+        edit_src_x = static_cast<int>(cx); edit_src_z = static_cast<int>(cy);
+    }
+}
+// =============================================================================
+// 新增：高保真物理场纹理上传器 (将 CPU 端的非均匀物性打包高速送入 OpenGL)
+// =============================================================================
+inline void UpdateModelTexture() {
+    if (g_modelTex == 0) {
+        glGenTextures(1, &g_modelTex);
+    }
+
+    // 分配一个 RGBA32F 浮点型临时缓冲区 (对应 ctx.total_grid 个像素)
+    std::vector<float> temp_data(ctx.total_grid * 4, 0.0f);
+
+    for (int i = 0; i < ctx.total_grid; ++i) {
+        float rho = ctx.rho[i];
+        float vp = 0.0f;
+        float vs = 0.0f;
+        if (rho > 0.0f) {
+            vp = sqrtf(ctx.lambda2mu[i] / rho);
+            vs = sqrtf(ctx.mu[i] / rho);
+        }
+
+        // 归一化后存入通道
+        temp_data[i * 4 + 0] = vp / 6000.0f;     // R 通道: 纵波速度 Vp (映射至 6000m/s)
+        temp_data[i * 4 + 1] = vs / 3500.0f;     // G 通道: 横波速度 Vs
+        temp_data[i * 4 + 2] = rho / 3000.0f;    // B 通道: 密度 Rho
+        temp_data[i * 4 + 3] = 1.0f;             // A 通道
+    }
+
+    glBindTexture(GL_TEXTURE_2D, g_modelTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, ctx.NX, ctx.NZ, 0, GL_RGBA, GL_FLOAT, temp_data.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+// 一键应用场景 (完美同步修正版)
+inline void ApplyScenario(int type, SimState& state) {
+    state.running = false;
+    current_it = 0;
+    accumulated_compute_time = 0.0f;
+    active_sources.clear(); // 清空多点激发队列
+
+    // 1. 确保 CPU 物理场上下文 NX/NZ、步长、c1_h等完全建立
+    setupTestContext(ctx, par);
+
+    // 2. 根据场景类型，精确定制重写 CPU 数组（此时 rho, mu, lambda2mu 被写入地壳/水层等真实参数）
+    LoadScenario(type);
+
+    // 3. 注销并重装 GPU 显存
+    freeGPUSimulation(gpu_data);
+    initGPUSimulation(gpu_data, ctx);
+
+    // 4. 同步更新地质背景图纹理
+    UpdateModelTexture();
+}
+// =============================================================================
+// 【高级模型加载器】：从您的自定义 3-Component 文本文件中高精度载入地质模型
+//  1. 完美解析 "# Dimensions" 自定义标定头
+//  2. 100% 物理对齐：处理 flipVertically，确保加载后地表 (0m) 绝对居顶
+//  3. 自动同步 CPU 弹性参数、OpenGL 纹理尺寸，并一键重装 GPU 显存，防止越界闪退
+// =============================================================================
+// 确保函数签名接收 gl 和 state 参数，以解决作用域引用问题 [3]
+inline bool LoadModelFromTxt(const std::string& filename, bool flipVertically, GLHandles& gl, SimState& state) {
+    std::cout << "[IO] Loading custom ASCII model: " << filename << " (Flip Y: " << (flipVertically ? "Yes" : "No") << ")" << std::endl;
+
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "[IO] Error: Could not open model file: " << filename << std::endl;
+        return false;
+    }
+
+    // ... 1. 解析 Dimensions 头部代码 (保持不变) ...
+    std::string line;
+    int file_w = 0, file_h = 0;
+    bool dimensionsFound = false;
+    while (std::getline(file, line)) {
+        if (line.rfind("# Dimensions", 0) == 0) {
+            sscanf_s(line.c_str(), "# Dimensions (Width x Height): %d %d", &file_w, &file_h);
+            if (file_w > 0 && file_h > 0) dimensionsFound = true;
+            break;
+        }
+    }
+
+    if (!dimensionsFound) {
+        std::cerr << "[IO] Error: Missing '# Dimensions' header." << std::endl;
+        return false;
+    }
+
+    // 2. 模拟重载安全拦截
+    state.running = false; // <-- 成功利用参数访问
+    current_it = 0;
+    accumulated_compute_time = 0.0f;
+    active_sources.clear();
+
+    edit_w = file_w;
+    edit_h = file_h;
+    par.model.xnum = edit_w;
+    par.model.znum = edit_h;
+
+    setupTestContext(ctx, par);
+
+    // 3. 逐行解析数据
+    file.clear();
+    file.seekg(0, std::ios::beg);
+
+    int pixelCount = 0;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+
+        std::stringstream ss(line);
+        float vp = 0.0f, vs = 0.0f, rho = 0.0f;
+        if (!(ss >> vp >> vs >> rho)) continue;
+
+        if (pixelCount >= ctx.total_grid) break;
+
+        int currentX = pixelCount % ctx.NX;
+        int currentY = pixelCount / ctx.NX;
+
+        int targetX = currentX;
+        int targetY = currentY;
+
+        if (flipVertically) {
+            targetY = ctx.NZ - 1 - currentY; // 垂直地表对齐
+        }
+
+        SetMaterialAt(targetX, targetY, vp, vs, rho);
+        pixelCount++;
+    }
+    file.close();
+
+    // 4. 重置激发位置与 PML 表面波
+    ctx.src_z_idx = ctx.NZ / 4;
+    ctx.src_idx = ctx.src_z_idx * ctx.NX + (ctx.NX / 2);
+    edit_src_x = ctx.NX / 2;
+    edit_src_z = ctx.NZ / 4;
+
+    ctx.dp_flat.assign(ctx.NX, 0.0f);
+    int fs_idx = ctx.npml;
+    for (int j = 0; j < ctx.NX; ++j) {
+        int k = fs_idx * ctx.NX + j;
+        if (k < ctx.total_grid && ctx.lambda2mu[k] > 0.0f) {
+            float l2m = ctx.lambda2mu[k];
+            float lam = ctx.lambda[k];
+            ctx.dp_flat[j] = (l2m * l2m - lam * lam) / l2m;
+        }
+    }
+
+    // 5. 释放并安全重写显存
+    freeGPUSimulation(gpu_data);
+    cudaGraphicsUnregisterResource(gl.cudaSeisRes); // <-- 成功利用参数访问
+    glBindTexture(GL_TEXTURE_2D, gl.seisTex);       // <-- 成功利用参数访问
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ctx.NX, ctx.NZ, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    cudaGraphicsGLRegisterImage(&gl.cudaSeisRes, gl.seisTex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
+
+    initGPUSimulation(gpu_data, ctx);
+
+    UpdateModelTexture(); // 重写地质背景纹理
+    first_align_needed = true;
+
+    return true;
+}
+// --- Open File Dialog ---
+inline bool OpenSystemFileDialog(char* buffer, int bufferSize) {
+    // Clear the buffer
+    memset(buffer, 0, bufferSize);
+
+#ifdef _WIN32
+    // Windows Implementation
+    OPENFILENAMEA ofn;
+    memset(&ofn, 0, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = NULL;
+    ofn.lpstrFile = buffer;
+    ofn.nMaxFile = bufferSize;
+    ofn.lpstrFilter = "Model Data (*.txt;*.sgy;*.csv)\0*.txt;*.sgy;*.segy;*.csv\0All Files (*.*)\0*.*\0";
+    ofn.nFilterIndex = 1; // 默认选中第一个 (Model Data)
+    ofn.nFilterIndex = 1;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+    return GetOpenFileNameA(&ofn);
+#else
+    // Linux Implementation (requires zenity)
+    const char* cmd = "zenity --file-selection --file-filter='*.txt' --title='Select Model Data'";
+    FILE* pipe = popen(cmd, "r");
+    if (!pipe) {
+        std::cerr << "[IO Error] Zenity not found. Please install it to use the file dialog." << std::endl;
+        return false;
+    }
+    bool success = false;
+    if (fgets(buffer, bufferSize, pipe) != NULL) {
+        size_t len = strlen(buffer);
+        if (len > 0 && buffer[len - 1] == '\n') {
+            buffer[len - 1] = '\0'; // Remove trailing newline
+        }
+        success = (strlen(buffer) > 0);
+    }
+    pclose(pipe);
+    return success;
+#endif
+}
+
+#ifdef _WIN32
+// =============================================================================
+// 新增：Windows 原生保存文件对话框 (安全保护：OFN_NOCHANGEDIR 杜绝工作路径被篡改)
+// =============================================================================
+inline bool SaveSystemFileDialog(char* outPath, DWORD maxPathLen) {
+    OPENFILENAMEA ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = NULL;
+    ofn.lpstrFile = outPath;
+    ofn.lpstrFile[0] = '\0';
+    ofn.nMaxFile = maxPathLen;
+    ofn.lpstrFilter = "Seismic SEGY (*.sgy)\0*.sgy;*.segy\0All Files (*.*)\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFileTitle = NULL;
+    ofn.nMaxFileTitle = 0;
+    ofn.lpstrInitialDir = NULL;
+
+    // OFN_NOCHANGEDIR 极其关键，防止更改程序运行目录导致相对路径着色器失效
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
+
+    return GetSaveFileNameA(&ofn) == TRUE;
+}
+#else
+inline bool SaveSystemFileDialog(char* outPath, size_t maxPathLen) {
+    return false;
+}
+#endif
+
+// =============================================================================
+// 【高级模型加载器】：从 3 个标准的二维 SEG-Y 文件中同时载入地层物理常数 (Vp, Vs, Rho)
+//  1. 自动对齐并验证三个 SGY 文件的 NX、NZ 尺寸是否一致
+//  2. 100% 物理对齐：利用 flipVertically 确保地表 Z=0 完美对齐到视口顶端
+//  3. 安全注销并重整 OpenGL 纹理尺寸，重装 GPU 显存，防止 CUDA 运行期崩溃
+// =============================================================================
+// =============================================================================
+// 升级版导入器：支持水平 (flipHorizontally) 和垂直 (flipVertically) 双向翻转
+// =============================================================================
+inline bool LoadModelFromSegy(
+    const std::string& vp_path,
+    const std::string& vs_path,
+    const std::string& rho_path,
+    bool flipVertically,
+    bool flipHorizontally, // <-- 新增水平翻转参数
+    GLHandles& gl,
+    SimState& state
+) {
+    std::cout << "[IO] Loading SEGY model files (Flip X: " << (flipHorizontally ? "Yes" : "No") << ")..." << std::endl;
+
+    auto data_vp = SeismicIO::readSegyFile2D(vp_path);
+    auto data_vs = SeismicIO::readSegyFile2D(vs_path);
+    auto data_rho = SeismicIO::readSegyFile2D(rho_path);
+
+    if (data_vp.empty() || data_vs.empty() || data_rho.empty()) {
+        std::cerr << "[IO] Error: One or more SEGY files failed to load." << std::endl;
+        return false;
+    }
+
+    int file_w = static_cast<int>(data_vp.size());
+    int file_h = static_cast<int>(data_vp[0].size());
+
+    if (data_vs.size() != file_w || data_vs[0].size() != file_h ||
+        data_rho.size() != file_w || data_rho[0].size() != file_h) {
+        std::cerr << "[IO] Error: SEGY model dimensions are out of sync!" << std::endl;
+        return false;
+    }
+
+    state.running = false;
+    current_it = 0;
+    accumulated_compute_time = 0.0f;
+    active_sources.clear();
+
+    edit_w = file_w;
+    edit_h = file_h;
+    par.model.xnum = edit_w;
+    par.model.znum = edit_h;
+
+    setupTestContext(ctx, par);
+
+    for (int x = 0; x < ctx.NX; ++x) {
+        for (int z = 0; z < ctx.NZ; ++z) {
+            float vp = data_vp[x][z];
+            float vs = data_vs[x][z];
+            float rho = data_rho[x][z];
+
+            // 智能密度量纲判定与防呆
+            if (rho > 0.0f && rho < 10.0f) {
+                rho *= 1000.0f;
+            }
+            if (rho < 10.0f) {
+                rho = 1000.0f;
+            }
+
+            // A. 水平坐标对齐计算 [3]
+            int targetX = x;
+            if (flipHorizontally) {
+                targetX = ctx.NX - 1 - x; // 水平翻转 (左右对齐)
+            }
+
+            // B. 垂直坐标对齐计算
+            int targetZ = z;
+            if (flipVertically) {
+                targetZ = ctx.NZ - 1 - z; // 垂直翻转 (上下对齐)
+            }
+
+            SetMaterialAt(targetX, targetZ, vp, vs, rho);
+        }
+    }
+
+    ctx.src_z_idx = ctx.NZ / 4;
+    ctx.src_idx = ctx.src_z_idx * ctx.NX + (ctx.NX / 2);
+    edit_src_x = ctx.NX / 2;
+    edit_src_z = ctx.NZ / 4;
+
+    ctx.dp_flat.assign(ctx.NX, 0.0f);
+    int fs_idx = ctx.npml;
+    for (int j = 0; j < ctx.NX; ++j) {
+        int k = fs_idx * ctx.NX + j;
+        if (k < ctx.total_grid && ctx.lambda2mu[k] > 0.0f) {
+            float l2m = ctx.lambda2mu[k];
+            float lam = ctx.lambda[k];
+            ctx.dp_flat[j] = (l2m * l2m - lam * lam) / l2m;
+        }
+    }
+
+    freeGPUSimulation(gpu_data);
+    cudaGraphicsUnregisterResource(gl.cudaSeisRes);
+    glBindTexture(GL_TEXTURE_2D, gl.seisTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ctx.NX, ctx.NZ, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    cudaGraphicsGLRegisterImage(&gl.cudaSeisRes, gl.seisTex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
+
+    initGPUSimulation(gpu_data, ctx);
+    UpdateModelTexture();
+    first_align_needed = true;
+
+    return true;
+}
+
+// =============================================================================
+// 【高级模型导出器】：将当前场景中的非均匀模型逆向反推并导出为 3 个标准的 SGY 文件
+//  1. 自动在文件名后部追加 _vp.sgy、_vs.sgy、_rho.sgy。
+//  2. 逆向计算：从拉梅常数反算 Vp、Vs。
+//  3. 内存转置：将 CPU 端的行优先 (Row-Major) 矩阵转置为 SGY 标准的一道道列优先 (Column-Major) 数组。
+//  4. 密度单位自适应切换 (kg/m3 或 g/cm3)。
+// =============================================================================
+// =============================================================================
+// 升级版导出器：支持导出时进行水平翻转 (flipHorizontally)
+// =============================================================================
+inline bool ExportModelToSegy(const std::string& base_filepath, bool density_gcm3, bool flipHorizontally) {
+    if (ctx.total_grid <= 0) return false;
+
+    std::cout << "[IO] Preparing SEGY Export (Flip X: " << (flipHorizontally ? "Yes" : "No") << ")..." << std::endl;
+
+    std::string clean_path = base_filepath;
+    size_t dot_pos = clean_path.find_last_of('.');
+    if (dot_pos != std::string::npos) {
+        clean_path = clean_path.substr(0, dot_pos);
+    }
+    std::string out_vp_path = clean_path + "_vp.sgy";
+    std::string out_vs_path = clean_path + "_vs.sgy";
+    std::string out_rho_path = clean_path + "_rho.sgy";
+
+    std::vector<float> flat_vp(ctx.total_grid, 0.0f);
+    std::vector<float> flat_vs(ctx.total_grid, 0.0f);
+    std::vector<float> flat_rho(ctx.total_grid, 0.0f);
+
+    for (int x = 0; x < ctx.NX; ++x) {
+        for (int z = 0; z < ctx.NZ; ++z) {
+
+            // 核心修复：根据用户要求，导出时进行水平翻转映射 [3]
+            int targetX = x;
+            if (flipHorizontally) {
+                targetX = ctx.NX - 1 - x;
+            }
+
+            int k_cuda = z * ctx.NX + targetX; // 映射至真实的显存物理位置
+            int k_segy = x * ctx.NZ + z;
+
+            float rho_val = ctx.rho[k_cuda];
+            float vp_val = 0.0f;
+            float vs_val = 0.0f;
+
+            if (rho_val > 0.0f) {
+                vp_val = sqrtf(ctx.lambda2mu[k_cuda] / rho_val);
+                vs_val = sqrtf(ctx.mu[k_cuda] / rho_val);
+            }
+
+            flat_vp[k_segy] = vp_val;
+            flat_vs[k_segy] = vs_val;
+
+            if (density_gcm3) {
+                flat_rho[k_segy] = rho_val / 1000.0f;
+            }
+            else {
+                flat_rho[k_segy] = rho_val;
+            }
+        }
+    }
+
+    float dummy_dt = 0.001f;
+    SeismicIO::writeSegyFile2D(flat_vp, ctx.NX, ctx.NZ, out_vp_path, dummy_dt);
+    SeismicIO::writeSegyFile2D(flat_vs, ctx.NX, ctx.NZ, out_vs_path, dummy_dt);
+    SeismicIO::writeSegyFile2D(flat_rho, ctx.NX, ctx.NZ, out_rho_path, dummy_dt);
+
+    std::cout << "[IO] Model Export Completed." << std::endl;
+    return true;
+}
+
+// =============================================================================
+// 4. 模块化子函数一：初始化显存与网格资源
+// =============================================================================
+
+// =============================================================================
+// 5. 模块化子函数一：初始化显存与网格资源
+// =============================================================================
+inline void InitializeSeismicSimulation(GLHandles& gl) {
     if (!is_seis_initialized) {
+        edit_src_x = edit_w / 2;
+        edit_src_z = edit_h / 4; // 震源默认深度设为 1/4
 
-        // 默认将模拟分辨率设置为 500x500 
-        par.model.xnum = edit_w; // 动态读取默认值
-        par.model.znum = edit_h; // 动态读取默认值
-        par.model.dx = 1.0f; // 空间步长 1.0m
+        par.model.xnum = edit_w;
+        par.model.znum = edit_h;
+        par.model.dx = 1.0f;
         par.model.dz = 1.0f;
-        par.FDM.f0 = edit_f0;  // 30Hz 配合 1.0m 网格，无频散 [8]
-        
+        par.FDM.f0 = edit_f0;
+
         setupTestContext(ctx, par);
         initGPUSimulation(gpu_data, ctx);
 
-        // 初始化对应的 OpenGL 纹理与 CUDA 注册
         glGenTextures(1, &gl.seisTex);
         glBindTexture(GL_TEXTURE_2D, gl.seisTex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ctx.NX, ctx.NZ, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
-        // 注册到 CUDA（WriteOnly，用于零拷贝直接写入纹理）
         cudaGraphicsGLRegisterImage(&gl.cudaSeisRes, gl.seisTex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
 
         is_seis_initialized = true;
-        first_align_needed = true; // 数据就绪，标记在下面进行首次精确对齐
+        first_align_needed = true;
+        UpdateModelTexture();
     }
+}
 
-    // --- [2. 持久化模拟控制变量] ---
-    static int current_it = 0;
-    static float accumulated_compute_time = 0;
-    static float color_scale = 1e1f;
-    static int show_component = 0; // 0: Vz, 1: Vx
-    static int steps_per_frame = 10; // 每帧迭代物理步数
-    static bool showHUD = true;
-
-    static int waveStyle = 0; // 默认采用极其绚丽的 Style 1
-
-    static int edit_src_x = ctx.NX / 2;
-    static int edit_src_z = ctx.NZ / 4;
-    static float edit_angle = par.FDM.angle;
-
-    // 【新增】：多震源模式控制开关与 CPU 队列
-    static bool multi_source_mode = false;  // 默认不开启 (保持单点重置模式)
-    static std::vector<GPUSource> active_sources; // CPU 端的活跃震源容器
-
-    // 【新增】：是否开启无限演化模式 (默认关闭)
-    static bool infinite_mode = false;
-
-    // --- [3. 鼠标缩放与平移逻辑] ---
-    static float viewZoom = 1.0f;
-    static ImVec2 viewOffset = { 0.0f, 0.0f };
-    // -- - [3. 【核心修复】：安全地进行首次左上角自适应吸附] -- -
+// =============================================================================
+// 6. 模块化子函数二：物理与时间自适应对齐
+// =============================================================================
+inline void ApplyCameraAutoAlignment(int winW, int winH, float barHeight) {
     if (first_align_needed && winH > 0 && ctx.NX > 0) {
         float winAspect = (float)winW / (float)winH;
         float simAspect = (float)ctx.NX / (float)ctx.NZ;
@@ -338,194 +1033,40 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
             aspectCorr.y = simAspect / winAspect;
         }
 
-        // 精确计算左上角吸附平移量
         viewOffset.x = aspectCorr.x - 1.0f;
         viewOffset.y = 1.0f - aspectCorr.y * (1.0f - 2.0f * barHeight / (float)winH);
-        first_align_needed = false; // 首次对齐完成，关闭标记
+        first_align_needed = false;
     }
+}
 
-    if (!io.WantCaptureMouse) {
-        if (io.MouseWheel != 0) {
-            float mouseSpeed = 0.1f * viewZoom;
-            viewZoom += io.MouseWheel * mouseSpeed;
-            if (viewZoom < 0.1f) viewZoom = 0.1f;
-            if (viewZoom > 100.0f) viewZoom = 100.0f;
-        }
-        if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
-            viewOffset.x -= 2*io.MouseDelta.x / (winW * viewZoom);
-            viewOffset.y += 2*io.MouseDelta.y / (winH * viewZoom);
-        }
-    }
-    // ============================================================
-    // 【完美修正版：鼠标左键点击注入震源】
-    // ============================================================
-    // =============================================================================
-    // 【智能分流与频率限制系统：鼠标左键点击 / 按压拖动持续注入震源】
-    // =============================================================================
-    static double last_inject_time = 0.0;
-    double current_time = glfwGetTime();
+// =============================================================================
+// 7. 模块化子函数三：鼠标点击/按压及键盘信号交互处理
+// =============================================================================
+inline void HandleSeismicInteractions(SimState& state, int winW, int winH, float barHeight) {
+    ImGuiIO& io = ImGui::GetIO();
 
-    bool trigger_active = false;
-
-    if (multi_source_mode) {
-        // A. 多震源模式：只要鼠标按住不放，且距离上一次注入超过 40ms (25Hz 频宽) 则持续注入
-        if (ImGui::IsMouseDown(0) && (current_time - last_inject_time >= 0.04)) {
-            trigger_active = true;
-            last_inject_time = current_time; // 刷新计时器
-        }
-    }
-    else {
-        // B. 单点震源模式：必须是单次点击触发，防止连续重置导致波场无法向前传播
-        if (ImGui::IsMouseClicked(0)) {
-            trigger_active = true;
-        }
-    }
-
-    if (!io.WantCaptureMouse && trigger_active) {
-        float normX = io.MousePos.x / (float)winW;
-        float normY = io.MousePos.y / (float)winH; // 0 at top, 1 at bottom
-
-        // 计算屏幕比例裁剪
-        float winAspect = (float)winW / (float)winH;
-        float simAspect = (float)ctx.NX / (float)ctx.NZ;
-        ImVec2 aspectCorr = { 1.0f, 1.0f };
-        if (winAspect > simAspect) {
-            aspectCorr.x = winAspect / simAspect;
-        }
-        else {
-            aspectCorr.y = simAspect / winAspect;
-        }
-
-        // =========================================================
-        // 【核心数学修正公式】
-        // 1. viewOffset 必须乘以 0.5f，因为 NDC 空间[-1,1]到纹理空间[0,1]有2倍尺寸差
-        // 2. Y 轴的平移项前必须使用减号（-），以抵消 Fragment Shader 中的 1.0-Y 反转
-        // =========================================================
-        float worldX = (normX - 0.5f) * (aspectCorr.x / viewZoom) + 0.5f + (0.5f * viewOffset.x);
-        float worldY = (normY - 0.5f) * (aspectCorr.y / viewZoom) + 0.5f - (0.5f * viewOffset.y);
-
-        // 转换为网格离散索引
-        int mx = (int)(worldX * (float)ctx.NX);
-        int my = (int)(worldY * (float)ctx.NZ);
-
-        // PML 边界安全判定 [4]
-        int min_valid = ctx.npml + 0;
-        int max_valid_x = ctx.NX - ctx.npml - 0;
-        int max_valid_z = ctx.NZ - ctx.npml - 0;
-
-        if (mx >= min_valid && mx <= max_valid_x && my >= min_valid && my <= max_valid_z) {
-            int clicked_idx = my * ctx.NX + mx;
-
-            if (multi_source_mode) {
-                // =====================================================
-                // 【多点持续按压注入逻辑】：将震源送入 CPU 活跃队列并拷贝至 GPU
-                // =====================================================
-                GPUSource new_src;
-                new_src.idx = clicked_idx;
-                new_src.t = 0.0f;
-                new_src.f_peak = edit_f0; // 采用当前滑块设置的主频
-                new_src.amp = 1.0f;
-
-                // 限制队列最大活跃数（设为 150），防止显存溢出
-                if (active_sources.size() < 150) {
-                    active_sources.push_back(new_src);
-                }
-
-                // 实时同步 OSD 准星与滑块位置
-                edit_src_x = mx;
-                edit_src_z = my;
-            }
-            else {
-                // =====================================================
-                // 【单点重置注入逻辑】：点击一键重置并单独激发 (保持不变)
-                // =====================================================
-                ctx.src_z_idx = my;
-                ctx.src_idx = clicked_idx;
-                edit_src_x = mx;
-                edit_src_z = my;
-
-                current_it = 0;
-                state.running = true;
-                accumulated_compute_time = 0.0f;
-
-                freeGPUSimulation(gpu_data);
-                initGPUSimulation(gpu_data, ctx);
-                std::fill(ctx.record_vx.begin(), ctx.record_vx.end(), 0.0f);
-                std::fill(ctx.record_vz.begin(), ctx.record_vz.end(), 0.0f);
-            }
-        }
-    }
-
-    // =============================================================================
-    // 【 新增：高精度鼠标悬停位置逆向映射与物性提取算法 】
-    // =============================================================================
-    ImVec2 mousePos = ImGui::GetMousePos();
-    // 判定鼠标是否在有效的主缓冲区视口内（避开顶部和底部状态栏）
-    bool is_mouse_inside = (mousePos.x >= 0.0f && mousePos.x < (float)winW &&
-        mousePos.y >= barHeight && mousePos.y < (float)(winH - barHeight));
-
-    // 如果鼠标正在操作 ImGui 面板，不捕获物理场位置
-    if (ImGui::GetIO().WantCaptureMouse) {
-        is_mouse_inside = false;
-    }
-
-    int mx = 0, my = 0;
-    float h_Vp = 0.0f, h_Vs = 0.0f, h_Rho = 0.0f;
-    bool is_valid_grid = false;
-
-    if (is_mouse_inside) {
-        // 计算屏幕比例裁剪
-        float winAspect = (float)winW / (float)winH;
-        float simAspect = (float)ctx.NX / (float)ctx.NZ;
-        ImVec2 aspectCorr = { 1.0f, 1.0f };
-        if (winAspect > simAspect) {
-            aspectCorr.x = winAspect / simAspect;
-        }
-        else {
-            aspectCorr.y = simAspect / winAspect;
-        }
-
-        // 归一化鼠标
-        float normX = mousePos.x / (float)winW;
-        float normY = mousePos.y / (float)winH; // 0 at top, 1 at bottom
-
-        // 高精度逆向矩阵投影
-        float worldX = (normX - 0.5f) * (aspectCorr.x / viewZoom) + 0.5f + (0.5f * viewOffset.x);
-        float worldY = (normY - 0.5f) * (aspectCorr.y / viewZoom) + 0.5f - (0.5f * viewOffset.y);
-
-        mx = (int)(worldX * (float)ctx.NX);
-        my = (int)(worldY * (float)ctx.NZ);
-
-        // 判定计算出的网格坐标是否越界 [4]
-        if (mx >= 0 && mx < ctx.NX && my >= 0 && my < ctx.NZ) {
-            int k = my * ctx.NX + mx;
-            h_Rho = ctx.rho[k];
-            // 从 CPU 弹性矩阵中提取当前网格物性，实时反推 Vp 和 Vs [3]
-            if (h_Rho > 0.0f) {
-                h_Vp = sqrtf(ctx.lambda2mu[k] / h_Rho);
-                h_Vs = sqrtf(ctx.mu[k] / h_Rho);
-                is_valid_grid = true;
-            }
-        }
-    }
-
-    // =============================================================================
-    // 【 键盘与按钮信号集中处理执行区 】
-    // =============================================================================
-
-    // A. 响应 C 键（或按钮）重置模拟
+    // A. 响应键盘 R 键或 C 键重置信号 (Command Pattern) [1.2.7]
     if (g_resetSimRequested) {
         current_it = 0;
         state.running = false;
-        accumulated_compute_time = 0.0f; // 计时器归零
-
+        accumulated_compute_time = 0.0f;
+        active_sources.clear();
+        ctx.dp_flat.assign(ctx.NX, 0.0f);
+        int fs_idx = ctx.npml;
+        for (int j = 0; j < ctx.NX; ++j) {
+            int k = fs_idx * ctx.NX + j;
+            if (k < ctx.total_grid && ctx.lambda2mu[k] > 0.0f) {
+                float l2m = ctx.lambda2mu[k];
+                float lam = ctx.lambda[k];
+                ctx.dp_flat[j] = (l2m * l2m - lam * lam) / l2m;
+            }
+        }
         freeGPUSimulation(gpu_data);
         initGPUSimulation(gpu_data, ctx);
-
+        UpdateModelTexture();
         std::fill(ctx.record_vx.begin(), ctx.record_vx.end(), 0.0f);
         std::fill(ctx.record_vz.begin(), ctx.record_vz.end(), 0.0f);
-
-        g_resetSimRequested = false; // 消费信号，自动复位
+        g_resetSimRequested = false;
     }
 
     // B. 响应 R 键（或按钮）重置视角
@@ -550,8 +1091,128 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
         active_sources.clear();
     }
 
-    // --- [4. 执行 CUDA 有限差分时间演化] ---
-    // 关键控制：如果开启了无限模式，则无视 nt 限制，一直向后迭代；否则在达到 nt 时停止
+    // B. 计算屏幕比例裁剪
+    float winAspect = (float)winW / (float)winH;
+    float simAspect = (float)ctx.NX / (float)ctx.NZ;
+    ImVec2 aspectCorr = { 1.0f, 1.0f };
+    if (winAspect > simAspect) aspectCorr.x = winAspect / simAspect;
+    else                         aspectCorr.y = simAspect / winAspect;
+
+    // C. 鼠标左键激发 (支持单点点击和多点连续按压拖动) [1.2.7]
+    static double last_inject_time = 0.0;
+    double current_time = glfwGetTime();
+    bool trigger_active = false;
+
+    if (multi_source_mode) {
+        if (ImGui::IsMouseDown(0) && (current_time - last_inject_time >= 0.04)) {
+            trigger_active = true;
+            last_inject_time = current_time;
+        }
+    }
+    else {
+        if (ImGui::IsMouseClicked(0)) {
+            trigger_active = true;
+        }
+    }
+
+    if (!io.WantCaptureMouse && trigger_active) {
+        float normX = io.MousePos.x / (float)winW;
+        float normY = io.MousePos.y / (float)winH;
+
+        float worldX = (normX - 0.5f) * (aspectCorr.x / viewZoom) + 0.5f + (0.5f * viewOffset.x);
+        float worldY = (normY - 0.5f) * (aspectCorr.y / viewZoom) + 0.5f - (0.5f * viewOffset.y);
+
+        int mx = (int)(worldX * (float)ctx.NX);
+        int my = (int)(worldY * (float)ctx.NZ);
+
+        int min_valid = ctx.npml + 0;
+        int max_valid_x = ctx.NX - ctx.npml - 0;
+        int max_valid_z = ctx.NZ - ctx.npml - 0;
+
+        if (mx >= min_valid && mx <= max_valid_x && my >= min_valid && my <= max_valid_z) {
+            int clicked_idx = my * ctx.NX + mx;
+
+            if (multi_source_mode) {
+                GPUSource new_src;
+                new_src.idx = clicked_idx;
+                new_src.t = 0.0f;
+                new_src.f_peak = edit_f0;
+                new_src.amp = 1.0f;
+
+                if (active_sources.size() < 150) {
+                    active_sources.push_back(new_src);
+                }
+                edit_src_x = mx;
+                edit_src_z = my;
+            }
+            else {
+                ctx.src_z_idx = my;
+                ctx.src_idx = clicked_idx;
+                edit_src_x = mx;
+                edit_src_z = my;
+
+                current_it = 0;
+                state.running = true;
+                accumulated_compute_time = 0.0f;
+
+                freeGPUSimulation(gpu_data);
+                initGPUSimulation(gpu_data, ctx);
+                std::fill(ctx.record_vx.begin(), ctx.record_vx.end(), 0.0f);
+                std::fill(ctx.record_vz.begin(), ctx.record_vz.end(), 0.0f);
+            }
+        }
+    }
+
+    // D. 鼠标中键拖拽平移与滚轮缩放 [2]
+    if (!io.WantCaptureMouse) {
+        if (io.MouseWheel != 0) {
+            float mouseSpeed = 0.1f * viewZoom;
+            viewZoom += io.MouseWheel * mouseSpeed;
+            if (viewZoom < 0.1f) viewZoom = 0.1f;
+            if (viewZoom > 100.0f) viewZoom = 100.0f;
+        }
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+            viewOffset.x -= 2 * io.MouseDelta.x / (winW * viewZoom);
+            viewOffset.y += 2 * io.MouseDelta.y / (winH * viewZoom);
+        }
+    }
+    ImVec2 mousePos = ImGui::GetMousePos();
+    // E. 鼠标悬停位置逆向映射与物性提取 (用于 BottomBar 监控)
+    is_mouse_inside = (mousePos.x >= 0.0f && mousePos.x < (float)winW &&
+        mousePos.y >= barHeight && mousePos.y < (float)(winH - barHeight));
+
+    if (io.WantCaptureMouse) {
+        is_mouse_inside = false;
+    }
+
+    hover_valid = false;
+    if (is_mouse_inside) {
+        float normX = mousePos.x / (float)winW;
+        float normY = mousePos.y / (float)winH;
+
+        float worldX = (normX - 0.5f) * (aspectCorr.x / viewZoom) + 0.5f + (0.5f * viewOffset.x);
+        float worldY = (normY - 0.5f) * (aspectCorr.y / viewZoom) + 0.5f - (0.5f * viewOffset.y);
+
+        hover_mx = (int)(worldX * (float)ctx.NX);
+        hover_my = (int)(worldY * (float)ctx.NZ);
+
+        if (hover_mx >= 0 && hover_mx < ctx.NX && hover_my >= 0 && hover_my < ctx.NZ) {
+            int k = hover_my * ctx.NX + hover_mx;
+            hover_Rho = ctx.rho[k];
+            if (hover_Rho > 0.0f) {
+                hover_Vp = sqrtf(ctx.lambda2mu[k] / hover_Rho);
+                hover_Vs = sqrtf(ctx.mu[k] / hover_Rho);
+                hover_valid = true;
+            }
+        }
+    }
+}
+
+// =============================================================================
+// 8. 模块化子函数四：执行 CUDA 有限差分时演更新
+// =============================================================================
+inline void UpdateWavefieldSimulation(SimState& state) {
+    ImGuiIO& io = ImGui::GetIO();
     bool can_run = state.running && (infinite_mode || current_it < ctx.nt);
 
     if (can_run) {
@@ -560,7 +1221,7 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
         for (int s = 0; s < steps_per_frame; ++s) {
             if (infinite_mode || current_it < ctx.nt) {
 
-                // 1. 更新多点激发寿命 (保持不变)
+                // A. 多点激发寿命更新与自动消亡
                 if (multi_source_mode && !active_sources.empty()) {
                     for (auto it = active_sources.begin(); it != active_sources.end(); ) {
                         it->t += ctx.dt;
@@ -578,18 +1239,22 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
                     }
                 }
 
-                // 2. 执行物理更新
+                // B. 执行 GPU 计算核函数推进
                 runGPUStep(gpu_data, current_it, ctx, multi_source_mode ? (int)active_sources.size() : -1);
                 current_it++;
             }
         }
     }
+}
 
-    // --- [5. 零拷贝互操作：CUDA 写入纹理] ---
+// =============================================================================
+// 9. 模块化子函数五：OpenGL 渲染全屏背景波场纹理
+// =============================================================================
+inline void RenderFullBackbufferWavefield(int winW, int winH, float barHeight, GLHandles& gl) {
+    // 1. 显存色彩映射与 2D copy 写入纹理
     cudaGraphicsMapResources(1, &gl.cudaSeisRes, 0);
     cudaGraphicsSubResourceGetMappedArray(&gl.cudaSeisArray, gl.cudaSeisRes, 0, 0);
 
-    // 在显存中分配一个临时RGBA缓冲区（仅在大小变化时重分配）
     static uchar4* d_rgba_out = nullptr;
     static int last_size = 0;
     if (last_size != ctx.total_grid) {
@@ -597,10 +1262,8 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
         cudaMalloc(&d_rgba_out, ctx.total_grid * sizeof(uchar4));
         last_size = ctx.total_grid;
     }
-    // 调用我们在 Cuda_Check.cu 中编写的高并发色彩映射核函数
     generateWavefieldTextureCUDA(gpu_data, d_rgba_out, color_scale, show_component);
 
-    // 直接将显存中的 RGBA 结果拷贝到 OpenGL 纹理中（完全不经过 CPU 主机）
     cudaMemcpy2DToArray(
         gl.cudaSeisArray, 0, 0,
         d_rgba_out,
@@ -611,55 +1274,70 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
     );
     cudaGraphicsUnmapResources(1, &gl.cudaSeisRes, 0);
 
-    // --- [6. 绘制全屏波场纹理背景] ---
-    // --- [ 渲染背景与全屏网格 ] ---
+    // 2. 着色器渲染管线
     glViewport(0, 0, winW, winH);
     glUseProgram(gl.seisProg);
 
-    // 传递地震专用着色器所需的各种 Uniform 参数
-    // 传入波场可视化风格代码
-    glUniform1i(glGetUniformLocation(gl.seisProg, "waveStyle"), waveStyle); // <-- 传递新增参数 [1.2.7]
+    // 绑定并载入地震波场纹理到单元 0
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, gl.seisTex);
+    glUniform1i(glGetUniformLocation(gl.seisProg, "seisTexture"), 0);
+
+    // =============================================================================
+    // 【核心修复】：激活单元 1 并绑定地质物性纹理，告诉着色器开始读取真实的二维层位 [1.2.7]
+    // =============================================================================
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, g_modelTex);
+    glUniform1i(glGetUniformLocation(gl.seisProg, "modelTexture"), 1);
+
+    // 传递地震及地质背景相关的 Uniform 变量 [1.2.7]
+    glUniform1i(glGetUniformLocation(gl.seisProg, "waveStyle"), waveStyle);
+    glUniform1i(glGetUniformLocation(gl.seisProg, "modelStyle"), modelStyle); // <-- 传递背景风格 [1.2.7]
+    // 实时将 C++ 的开关状态传递给着色器 [1.2.7]
+    glUniform1i(glGetUniformLocation(gl.seisProg, "showGrid"), showGrid ? 1 : 0);
+
+    // 【关键】：无缝向下传递当前滑块设置的 Vp 和 密度 (Rho)，建立物理场关联 [3]
+    // 假定使用均匀模型：从当前静态滑块中获取实时 Vp/Rho（支持后续加载 SEGY 的二维纹理接口）
+    glUniform1f(glGetUniformLocation(gl.seisProg, "uniformVp"), edit_Vp);
+    glUniform1f(glGetUniformLocation(gl.seisProg, "uniformRho"), edit_Density);
+    glUniform1i(glGetUniformLocation(gl.seisProg, "useModelTexture"), 1); // 暂不开启非均匀纹理，使用滑块数据
+
     glUniform2f(glGetUniformLocation(gl.seisProg, "winSize"), (float)winW, (float)winH);
     glUniform2f(glGetUniformLocation(gl.seisProg, "simSize"), (float)ctx.NX, (float)ctx.NZ);
     glUniform2f(glGetUniformLocation(gl.seisProg, "viewOffset"), viewOffset.x, viewOffset.y);
     glUniform1f(glGetUniformLocation(gl.seisProg, "viewZoom"), viewZoom);
+    glUniform1f(glGetUniformLocation(gl.seisProg, "totalTime"), (float)glfwGetTime());
+    glUniform1f(glGetUniformLocation(gl.seisProg, "npml"), (float)ctx.npml);
 
-    // 【传递新增参数】
-    glUniform1f(glGetUniformLocation(gl.seisProg, "totalTime"), (float)glfwGetTime()); // 用于扫描线滚动
-    glUniform1f(glGetUniformLocation(gl.seisProg, "npml"), (float)ctx.npml);           // 用于动态绘制 PML 边界
-
-    // 绑定纹理
+    // 绑定并载入纹理
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, gl.seisTex);
     glUniform1i(glGetUniformLocation(gl.seisProg, "seisTexture"), 0);
 
     glBindVertexArray(gl.quadVAO);
     glDrawArrays(GL_TRIANGLES, 0, 6);
+}
 
-    // =============================================================================
-     // 【 2. 标尺与光标渲染：直接覆盖在主缓冲区之上 】
-     // =============================================================================
-     // 构建全屏视口对应的 ViewportInfo 
-    ViewportInfo vp;
-    vp.x = 0.0f;
-    vp.y = 0.0f;
-    vp.w = (float)winW;
-    vp.h = (float)winH;
-    vp.scaleX = vp.w / (float)ctx.NX;
-    vp.scaleY = vp.h / (float)ctx.NZ;
+// =============================================================================
+// 10. 模块化子函数六：绘制 UI 面板、标尺、BottomBar 监控条及星空准星
+// =============================================================================
+inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, float scale, GLHandles& gl, const GpuInfo& info) {
+    ImGuiIO& io = ImGui::GetIO();
 
-    // A. 绘制主缓冲区标尺 (自动在 FDM 背景之上、ImGui 浮动窗口之下) [1.2.7]
+    // A. 绘制主缓冲区自适应标尺 (在波场之上，ImGui 控制面板之下)
     RenderGridRulerOnBackbuffer(ctx, state, winW, winH, barHeight, viewOffset, viewZoom);
 
-    // B. 绘制高亮科技鼠标光标 (使用 ForegroundDrawList 保证永远在最上层)
+    // B. 绘制高亮科技鼠标光标 (Fg 图层)
+    ViewportInfo vp;
+    vp.x = 0.0f; vp.y = 0.0f; vp.w = (float)winW; vp.h = (float)winH;
+    vp.scaleX = vp.w / (float)ctx.NX;
+    vp.scaleY = vp.h / (float)ctx.NZ;
     RenderBrushCursor(state, vp);
 
-    // 【新增】：绘制当前编辑位置的物理震源准星，传入刚刚定义在顶部的滑动条变量
+    // C. 绘制当前编辑/激发的物理震源橙色准星
     RenderSourceMarker(ctx, edit_src_x, edit_src_z, winW, winH, barHeight, viewOffset, viewZoom);
 
-    // 全局 UI 荧光主题色定义 (设置为 static，支持实时修改)
-    static ImVec4 uiAccent = ImVec4(0.5f, 1.0f, 0.5f, 1.0f); // 默认青色荧光
-    // --- [7. 顶部专业状态栏 (TopBar)] ---
+    // D. 渲染顶部 TopBar
     {
         ImGui::SetNextWindowPos({ 0, 0 });
         ImGui::SetNextWindowSize({ (float)winW, barHeight });
@@ -678,15 +1356,12 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
         {
             float centerY = 14.0f * scale;
 
-            // A. 左侧：GPU 信息
             ImGui::SetCursorPos({ 20 * scale, centerY });
             ImGui::TextDisabled("ACTIVE GPU:"); ImGui::SameLine();
             ImGui::TextColored(uiAccent, "%s", info.name);
 
-            // B. 【升级】：中间模拟参数指示 (新增：物理波场时间 + 实际计算耗时)
-            float physicalTime = current_it * ctx.dt; // 计算当前的物理传播时间 (秒) [6]
+            float physicalTime = current_it * ctx.dt;
 
-            // 对实际计算耗时进行精美格式化
             char computeTimeStr[64];
             if (accumulated_compute_time < 60.0f) {
                 sprintf(computeTimeStr, "%.6f s", accumulated_compute_time);
@@ -697,7 +1372,6 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
                 sprintf(computeTimeStr, "%02dm %.2fs", minutes, seconds);
             }
 
-            // 中间模拟参数指示
             char stepStr[128];
             if (infinite_mode) {
                 sprintf(stepStr, "%d / INF", current_it);
@@ -713,7 +1387,6 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
             ImGui::SetCursorPos({ (winW - textWidth) * 0.5f, centerY });
             ImGui::TextColored(uiAccent, "%s", statusStr);
 
-            // C. 右侧：帧率与 HUD 触发
             ImGui::SetCursorPos({ (float)winW - 260.0f * scale, centerY - 2.0f * scale });
 
             static float displayFPS = 60.0f;
@@ -729,7 +1402,6 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
         ImGui::PopStyleVar(2);
         ImGui::PopStyleColor(5);
 
-        // 状态栏底部荧光线
         ImDrawList* topDraw = ImGui::GetForegroundDrawList();
         topDraw->AddLine(
             { 0, barHeight },
@@ -737,21 +1409,18 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
             IM_COL32(uiAccent.x * 255, uiAccent.y * 255, uiAccent.z * 255, 60),
             1.0f
         );
-    };
+    }
 
-    // --- [8. 悬浮玻璃控制面板] ---
+    // E. 渲染悬浮控制面板 (LAB_CONTROLS)
     if (showHUD) {
-
         ImGui::SetNextWindowPos({ 30 * scale, 80 * scale }, ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize({ 420 * scale, 780 * scale }, ImGuiCond_FirstUseEver);
 
-        // 动态绑定主题色到窗口边框
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.95f, 1.0f, 0.98f, 0.3f)); // 半透明绿色
-        ImGui::PushStyleColor(ImGuiCol_Border, uiAccent);                             // 荧光主题色边框
+        ImGui::PushStyleColor(ImGuiCol_Border, uiAccent);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.5f);
 
-        // 统一注入主题色到滑块和选项卡
         ImGui::PushStyleColor(ImGuiCol_SliderGrab, uiAccent);
         ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(uiAccent.x * 1.2f, uiAccent.y * 1.2f, uiAccent.z * 1.2f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_TabActive, uiAccent);
@@ -760,100 +1429,67 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
         ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(uiAccent.x * 0.8f, uiAccent.y * 0.8f, uiAccent.z * 0.8f, 0.8f));
 
         if (ImGui::Begin("Control Panel", &showHUD)) {
-
-            // A. 显示平滑滤波后的 FPS
             static float displayFPS = 60.0f;
             displayFPS = displayFPS * 0.95f + io.Framerate * 0.05f;
             ImGui::TextColored(uiAccent, "FPS: %.1f", displayFPS);
             ImGui::Separator();
 
-            // =============================================================================
-            // 【核心重构：双 Tab 选项卡布局】
-            // =============================================================================
             if (ImGui::BeginTabBar("ControlTabs")) {
-
-                // -------------------------------------------------------------------------
-                // 选项卡一：Simulation (模拟算法与计算参数)
-                // -------------------------------------------------------------------------
                 if (ImGui::BeginTabItem("Simulation")) {
                     ImGui::Spacing();
-
-                    // 1. 模拟公式与算法类型选择 (Formulation) [8]
                     ImGui::TextColored(uiAccent, "Simulation Protocol");
                     const char* sim_types[] = { "Type 1: Whole-domain PML", "Type 2: Interior FDM + Boundary PML", "Type 3: Free Surface + PML" };
                     int temp_type = ctx.flag_type - 1;
                     if (ImGui::Combo("Formulation", &temp_type, sim_types, IM_ARRAYSIZE(sim_types))) {
                         ctx.flag_type = temp_type + 1;
-                        // 切换公式时，自动重置模拟并重装 GPU 显存
-                        current_it = 0;
-                        accumulated_compute_time = 0.0f; // <-- 新增归零
-                        state.running = false;
-                        freeGPUSimulation(gpu_data);
-                        initGPUSimulation(gpu_data, ctx);
+                        g_resetSimRequested = true;
                     }
                     ImGui::Spacing();
 
-                    // 2. 图像渲染与分量显示控制
-                    ImGui::TextColored(uiAccent, "Visualization Settings");
-                    ImGui::SliderInt("Steps / Frame", &steps_per_frame, 1, 10);
-
-                    // 3. 时间步长 (dt) 与最大迭代次数 (nt) 动态控制 [6]
-                    ImGui::Separator();
-                    ImGui::TextColored(uiAccent, "Time Step & Iteration Control");
-
-                    // 动态计算当前模型的最大 Vp 用于 CFL 稳定性检测
+                    ImGui::TextColored(uiAccent, "Time Step, Grid Spacing & Iteration Control");
                     float max_vp = 0.0f;
                     for (int k = 0; k < ctx.total_grid; ++k) {
                         float vp = sqrtf(ctx.lambda2mu[k] / ctx.rho[k]);
                         if (vp > max_vp) max_vp = vp;
                     }
-                    float dx_val = par.model.dx;
-                    float dt_limit = 0.5f * dx_val / max_vp;
 
                     static float temp_dt = ctx.dt;
-                    static float temp_dx = ctx.h; // 对应物理网格步长 dx
+                    static float temp_dx = ctx.h;
                     static int temp_nt = ctx.nt;
+                    static int temp_pml = ctx.npml;
 
                     ImGui::SliderFloat("Time Step (dt)", &temp_dt, 0.00001f, 0.003f, "%.6f s");
-
-                    // 【回归】：网格物理步长 dx 调节滑块，滑块拖动时将直接联动屏幕上标尺的刻度米数！
                     ImGui::SliderFloat("Grid Spacing (dx)", &temp_dx, 0.1f, 20.0f, "%.1f m");
-
+                    // 【回归】：PML 吸收层宽度实时滑块控制 [1.2.7]
+                    ImGui::SliderInt("PML Layer Width", &temp_pml, 10, 100, "%d px");
                     ImGui::SliderInt("Max Steps (nt)", &temp_nt, 500, 50000);
-                    ImGui::Spacing();
-                    
-                    // 稳定性 OSD 显示
+                    ImGui::SliderInt("Steps / Frame", &steps_per_frame, 1, 10);
+
+                    float dt_limit = 0.5f * temp_dx / max_vp;
                     bool is_stable = (temp_dt <= dt_limit);
                     ImGui::Text("Max Allowed dt (CFL Limit): %.6f s", dt_limit);
-                    if (is_stable) {
-                        ImGui::TextColored({ 0.2f, 1.0f, 0.4f, 1.0f }, "[ STATUS: CFL STABLE ]");
-                    }
-                    else {
-                        ImGui::TextColored({ 1.0f, 0.2f, 0.2f, 1.0f }, "[ STATUS: DIVERGENCE RISK! ]");
-                    }
+                    if (is_stable) ImGui::TextColored({ 0.2f, 1.0f, 0.4f, 1.0f }, "[ STATUS: CFL STABLE ]");
+                    else            ImGui::TextColored({ 1.0f, 0.2f, 0.2f, 1.0f }, "[ STATUS: DIVERGENCE RISK! ]");
 
                     ImGui::Spacing();
-                    // 3. 应用按钮：点击后将最新的 dx 和 dt 写入物理计算核心
                     if (ImGui::Button("APPLY TIME & SPACING CONTROLS", { -1, 30 * scale })) {
                         ctx.dt = temp_dt;
                         ctx.nt = temp_nt;
-
-                        // -------------------------------------------------------------
-                        // 【物理重算核心】：更新空间步长 h，并重新计算高阶有限差分系数
-                        // 确保空间步长改变后，弹性波动方程的数值求导结果完全缩放匹配
-                        // -------------------------------------------------------------
                         ctx.h = temp_dx;
                         par.model.dx = temp_dx;
-                        par.model.dz = temp_dx; // 保持二维网格均匀
+                        par.model.dz = temp_dx;
+
+                        // 【物理重算核心】：将全新设置的 PML 层数写入 context 和 parameters
+                        ctx.npml = temp_pml;
+                        par.FDM.npml = (float)temp_pml;
 
                         ctx.c1_h = 1.125022f / temp_dx;
                         ctx.c2_h = -0.04687594f / temp_dx;
                         ctx.c3_h = 0.00416669f / temp_dx;
                         ctx.c4_h = -0.00019234f / temp_dx;
 
-                        // 重新预计算自由表面 dp_flat 参数 (防止切换到 Type 3 时因空间步长改变导致溢出)
                         ctx.dp_flat.assign(ctx.NX, 0.0f);
-                        int fs_idx = ctx.npml;
+                        int fs_idx = ctx.npml; // 自由表面自动对齐全新设置的 PML 深度 [3]
                         for (int j = 0; j < ctx.NX; ++j) {
                             int k = fs_idx * ctx.NX + j;
                             if (k < ctx.total_grid && ctx.lambda2mu[k] > 0.0f) {
@@ -863,37 +1499,23 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
                             }
                         }
 
-                        // 重新分配相关的接收器历史数据大小 (因为总步数可能变了)
                         ctx.record_vx.assign(ctx.num_rcv * ctx.nt, 0.0f);
                         ctx.record_vz.assign(ctx.num_rcv * ctx.nt, 0.0f);
-
-                        // 重新生成雷克子波
                         generateRickerWavelet(ctx.wavelet, ctx.nt, ctx.dt, par.FDM.f0, par.FDM.t0);
-
-                        // 重置当前步，重装 GPU 显存
-                        current_it = 0;
-                        state.running = false;
-                        freeGPUSimulation(gpu_data);
-                        initGPUSimulation(gpu_data, ctx);
+                        g_resetSimRequested = true;
                     }
-
                     ImGui::Spacing();
-                    // =============================================================================
-                    // 【新增】：网格尺寸重置区 (实现模型大小实时在线修改) [1.2.7]
-                    // =============================================================================
+
                     ImGui::Separator();
                     ImGui::TextColored(uiAccent, "GRID DIMENSIONS (NX, NZ)");
-
-                    // 宽度调节加减组
                     ImGui::PushItemWidth(100 * scale);
                     ImGui::InputInt("##WidthVal", &edit_w, 0, 0); ImGui::SameLine();
                     ImGui::PopItemWidth();
                     if (ImGui::Button("-##WDec")) { edit_w = std::max(64, edit_w - 64); } ImGui::SameLine();
                     if (ImGui::Button("+##WInc")) { edit_w = std::min(8192, edit_w + 64); } ImGui::SameLine();
-                    ImGui::Text("Grid Width (NX)"); 
+                    ImGui::Text("Grid Width (NX)");
                     ImGui::Spacing();
 
-                    // 高度调节加减组
                     ImGui::PushItemWidth(100 * scale);
                     ImGui::InputInt("##HeightVal", &edit_h, 0, 0); ImGui::SameLine();
                     ImGui::PopItemWidth();
@@ -902,54 +1524,39 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
                     ImGui::Text("Grid Height (NZ)");
 
                     ImGui::Spacing();
-
-                    // 鲜红色的重构模型按钮
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.75f, 0.15f, 0.15f, 0.85f));
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.2f, 0.2f, 1.0f));
                     if (ImGui::Button("APPLY NEW GRID SIZE & CLEAR MODEL", { -1, 35 * scale })) {
-                        // 1. 停止当前模拟并重置状态
                         state.running = false;
                         current_it = 0;
                         accumulated_compute_time = 0.0f;
-                        active_sources.clear(); // 清空多震源
+                        active_sources.clear();
 
-                        // 2. 将最新的网格宽高写入 par
                         par.model.xnum = edit_w;
                         par.model.znum = edit_h;
 
-                        // 3. 重新在 CPU 端重构大小并计算差分系数
                         setupTestContext(ctx, par);
-
-                        // 4. 释放旧的 GPU 显存
                         freeGPUSimulation(gpu_data);
 
-                        // 5. 【核心安全保护】：注销旧纹理，调整 OpenGL 纹理大小，重新注册到 CUDA
                         cudaGraphicsUnregisterResource(gl.cudaSeisRes);
                         glBindTexture(GL_TEXTURE_2D, gl.seisTex);
                         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ctx.NX, ctx.NZ, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
                         cudaGraphicsGLRegisterImage(&gl.cudaSeisRes, gl.seisTex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
 
-                        // 6. 重新申请并初始化新的 GPU 显存
                         initGPUSimulation(gpu_data, ctx);
-
-                        // 7. 标记需要重新将视角对齐新视口的左上角
                         first_align_needed = true;
                     }
                     ImGui::PopStyleColor(2);
                     ImGui::Spacing();
                     ImGui::Separator();
                     ImGui::Checkbox("V-Sync Control", &state.vsyncEnabled);
-                    if (ImGui::IsItemDeactivatedAfterEdit()) {
-                        glfwSwapInterval(state.vsyncEnabled ? 1 : 0);
-                    }
+                    if (ImGui::IsItemDeactivatedAfterEdit()) glfwSwapInterval(state.vsyncEnabled ? 1 : 0);
                     ImGui::Spacing();
-                    // 【新增】：无限演化模式开关
                     ImGui::Checkbox("Continuous Simulation (Infinite Mode)", &infinite_mode);
                     if (ImGui::IsItemHovered()) {
                         ImGui::SetTooltip("Check to run the wavefield tank indefinitely.\nIdeal for interactive sandbox clicking.");
                     }
                     ImGui::Spacing();
-                    // 新增：多震源模式实时开关 [1.2.7]
                     ImGui::Checkbox("Enable Multi-Source Real-time Clicks", &multi_source_mode);
                     if (ImGui::IsItemHovered()) {
                         ImGui::SetTooltip("Check to click and spawn multiple intersecting waves simultaneously\nUncheck for standard single-point reset mode.");
@@ -957,17 +1564,9 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
                     ImGui::EndTabItem();
                 }
 
-                // -------------------------------------------------------------------------
-                // 选项卡二：Physics & Source (物性与震源参数控制)
-                // -------------------------------------------------------------------------
-                if (ImGui::BeginTabItem("Physics & Source")) {
-                    
+                if (ImGui::BeginTabItem("Source")) {
                     ImGui::Spacing();
-                    // 1. 震源激发参数设置
                     ImGui::TextColored(uiAccent, "Source Position & Angle");
-                    /*static int edit_src_x = ctx.NX / 2;
-                    static int edit_src_z = ctx.NZ / 2;
-                    static float edit_angle = par.FDM.angle;*/
 
                     int min_valid_grid = ctx.npml + 5;
                     int max_valid_x = ctx.NX - ctx.npml - 5;
@@ -977,20 +1576,13 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
                     ImGui::SliderInt("Source Z (Grid)", &edit_src_z, min_valid_grid, max_valid_z);
                     ImGui::SliderFloat("Force Angle", &edit_angle, -180.0f, 180.0f, "%.1f deg");
 
-                    
-                    // 2. 【核心新增】：雷克子波主频与延迟控制 [6]
                     ImGui::Separator();
                     ImGui::TextColored(uiAccent, "Ricker Wavelet Properties");
-
                     ImGui::SliderFloat("Peak Freq (f0)", &edit_f0, 5.0f, 300.0f, "%.1f Hz");
                     ImGui::SliderFloat("Time Delay (t0)", &edit_t0, 0.001f, 0.2f, "%.3f s");
 
-                    // =================================================================
-                    // 【高级黑科技】：实时动态雷克子波波形预览 (Wavelet Preview) [1.2.7]
-                    // 随着滑动条拖动，波形在控制面板内实时进行拉伸/挤压变化
-                    // =================================================================
                     ImGui::TextDisabled("Waveform Real-Time Preview:");
-                    float preview_dt = 0.0005f; // 固定高采样率保证预览曲线光滑
+                    float preview_dt = 0.0005f;
                     std::vector<float> preview_x(200);
                     std::vector<float> preview_y(200);
                     for (int i = 0; i < 200; ++i) {
@@ -1000,71 +1592,56 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
                         preview_y[i] = (1.0f - 2.0f * pi2_f0 * t * t) * expf(-pi2_f0 * t * t);
                     }
 
-                    // 1. 【局部修改配色】：将本图表强制设为黑底、荧光绿线 [1.2.7]
-                    ImPlot::PushStyleColor(ImPlotCol_FrameBg, IM_COL32(125, 125, 125, 255)); // 边框背景 (深钛金灰)
-                    ImPlot::PushStyleColor(ImPlotCol_PlotBg, IM_COL32(125, 125, 125, 255));     // 绘图背景 (纯黑)
-                    ImPlot::PushStyleColor(ImPlotCol_Line, IM_COL32(0, 255, 120, 255));   // 曲线颜色 (荧光绿)
-                    ImPlot::PushStyleColor(ImPlotCol_AxisGrid, IM_COL32(35, 35, 35, 120)); // 暗灰色微弱网格线
+                    ImPlot::PushStyleColor(ImPlotCol_FrameBg, IM_COL32(125, 125, 125, 255));
+                    ImPlot::PushStyleColor(ImPlotCol_PlotBg, IM_COL32(125, 125, 125, 255));
+                    ImPlot::PushStyleColor(ImPlotCol_Line, IM_COL32(0, 255, 120, 255));
+                    ImPlot::PushStyleColor(ImPlotCol_AxisGrid, IM_COL32(35, 35, 35, 120));
 
-                    // 2. 【核心修改】：在第三参数传入 ImPlotFlags_NoLegend 选项，直接优雅地隐藏 "Ricker" 标签 [1.2.7]
                     if (ImPlot::BeginPlot("##WaveletPreview", ImVec2(-1, 95 * scale), ImPlotFlags_NoLegend)) {
                         ImPlot::SetupAxes("Time", "Amp", ImPlotAxisFlags_NoTickLabels, ImPlotAxisFlags_NoTickLabels);
                         ImPlot::SetupAxesLimits(0.0f, 200 * preview_dt, -1.1f, 1.1f);
-
-                        // 【备用方案】：如果您不想取消，而是想把图例放在右侧 (East)，
-                        // 那么请删掉上面 BeginPlot 里的 ImPlotFlags_NoLegend，并取消下面这一行的注释：
-                        // ImPlot::SetupLegend(ImPlotLocation_East, ImPlotLegendFlags_None);
-
                         ImPlot::PlotLine("Ricker", preview_x.data(), preview_y.data(), 200);
                         ImPlot::EndPlot();
                     }
-
-                    // 3. 必须弹出 4 个颜色样式，防止污染底部的地震道 (Seismogram) 大图表 [1.2.7]
                     ImPlot::PopStyleColor(4);
 
-                    // 提交应用子波与震源属性
                     ImGui::Spacing();
                     if (ImGui::Button("APPLY SOURCE CONFIG", { -1, 30 * scale })) {
                         ctx.src_z_idx = edit_src_z;
                         ctx.src_idx = edit_src_z * ctx.NX + edit_src_x;
                         ctx.src_angle = edit_angle;
 
-                        par.FDM.f0 = edit_f0; // 写入静态持久化 par 中
+                        par.FDM.f0 = edit_f0;
                         par.FDM.t0 = edit_t0;
                         par.FDM.angle = edit_angle;
 
-                        // 重新计算子波并重构模拟
                         generateRickerWavelet(ctx.wavelet, ctx.nt, ctx.dt, edit_f0, edit_t0);
                         current_it = 0;
                         state.running = false;
-                        accumulated_compute_time = 0.0f; // 计时器重置
+                        accumulated_compute_time = 0.0f;
                         freeGPUSimulation(gpu_data);
                         initGPUSimulation(gpu_data, ctx);
                     }
                     ImGui::Spacing();
-                    // 【按钮激发单点震源回归】：在此处增加一个“按钮激发”机制 [1.2.7]
                     if (ImGui::Button("TRIGGER SINGLE SOURCE SHOT (C)", { -1, 30 * scale })) {
-                        // 强制关闭多震源模式，以便执行单震源重置
                         multi_source_mode = false;
-
                         ctx.src_z_idx = edit_src_z;
                         ctx.src_idx = edit_src_z * ctx.NX + edit_src_x;
-
-                        current_it = 0;
-                        state.running = true;
-                        accumulated_compute_time = 0.0f;
-
-                        freeGPUSimulation(gpu_data);
-                        initGPUSimulation(gpu_data, ctx);
-                        std::fill(ctx.record_vx.begin(), ctx.record_vx.end(), 0.0f);
-                        std::fill(ctx.record_vz.begin(), ctx.record_vz.end(), 0.0f);
+                        g_resetSimRequested = true;
                     }
                     ImGui::Spacing();
+                    ImGui::EndTabItem();
+                }
+                // =============================================================================
+                // 3. 【新重构的 TabItem】：Model & Preset (模型底图、预设场景与外部导入) [1.2.7]
+                // =============================================================================
+                if (ImGui::BeginTabItem("Model")) {
+                    ImGui::Spacing();
 
-                    // 2. 介质物性设置 (岩石物理耦合) [3]
-                    ImGui::Separator();
+                    // -------------------------------------------------------------
+                    // A. 岩石物理属性基本耦合 (Density Slide)
+                    // -------------------------------------------------------------
                     ImGui::TextColored(uiAccent, "Rock Physics Coupling");
-
                     static float edit_Vp = 2000.0f;
                     static float edit_Vs = 1400.0f;
                     static float edit_Density = 2000.0f;
@@ -1073,14 +1650,10 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
                     ImGui::SliderFloat("S-Wave Velocity (Vs)", &edit_Vs, 200.0f, 3500.0f, "%.1f m/s");
                     ImGui::SliderFloat("Density (Rho)", &edit_Density, 1000.0f, 3000.0f, "%.1f kg/m^3");
 
-                    // 弹性介质物理防呆约束
-                    if (edit_Vp < edit_Vs * 1.5f) {
-                        edit_Vp = edit_Vs * 1.5f;
-                    }
+                    if (edit_Vp < edit_Vs * 1.5f) edit_Vp = edit_Vs * 1.5f;
 
                     ImGui::Spacing();
                     if (ImGui::Button("APPLY PHYSICAL MEDIUM", { -1, 30 * scale })) {
-                        // 自动转换为拉梅常数 [3]
                         float mu_val = edit_Density * edit_Vs * edit_Vs;
                         float lambda2mu_val = edit_Density * edit_Vp * edit_Vp;
                         float lambda_val = lambda2mu_val - 2.0f * mu_val;
@@ -1090,27 +1663,221 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
                         ctx.lambda.assign(ctx.total_grid, lambda_val);
                         ctx.lambda2mu.assign(ctx.total_grid, lambda2mu_val);
 
-                        // 重新初始化并刷新 GPU 显存
-                        current_it = 0;
-                        accumulated_compute_time = 0.0f; // <-- 新增归零
-                        state.running = false;
-                        freeGPUSimulation(gpu_data);
-                        initGPUSimulation(gpu_data, ctx);
+                        g_resetSimRequested = true; // 发射重置信号并重新上传
+                    }
+                    ImGui::Spacing();
+
+                    // -------------------------------------------------------------
+                    // B. 场景预设一键加载区
+                    // -------------------------------------------------------------
+                    ImGui::Separator();
+                    ImGui::TextColored(uiAccent, "GEOPHYSICAL SCENARIO PRESETS");
+
+                    const char* scene_names[] = {
+                        "Uniform Medium (默认均匀地层)",
+                        "Earth Shell & Core (地球核幔分层)",
+                        "Double Slit Interference (双缝挡板干涉)",
+                        "3-Layered Crust (三层水平沉积岩)",
+                        "2-Layered Medium (双层高速低速分界面)",
+                        "Straight Waveguide (直条状低速波导通道)",
+                        "Curved Waveguide (正弦曲线弯曲波导)",
+                        "Phononic Crystal Hex (六角钢球声子晶体)",
+                        "Random Scattering (300个随机气泡强散射)",
+                        "Sinusoidal Interface (正弦起伏分层地质)",
+                        "Linear Velocity Gradient (连续线性速度梯度)",
+                        "Penrose Room (彭罗斯椭圆房间聚焦反射)"
+                    };
+
+                    static int selected_scene = current_scene;
+                    ImGui::Combo("Select Preset", &selected_scene, scene_names, IM_ARRAYSIZE(scene_names));
+                    // 亮荧光青色/橙色一键应用按钮 (自动继承 uiAccent 主题变色)
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(uiAccent.x * 0.15f, uiAccent.y * 0.5f, uiAccent.z * 0.4f, 0.75f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(uiAccent.x * 0.2f, uiAccent.y * 0.7f, uiAccent.z * 0.5f, 0.9f));
+                    ImGui::Spacing();
+                    if (ImGui::Button("APPLY SCENARIO & REALLOCATE", { -1, 32 * scale })) {
+                        current_scene = selected_scene;
+
+                        // 核心调用：重写 CPU 端弹性常数矩阵
+                        ApplyScenario(current_scene, state);
+
+                        // 尺寸滑块强制双向同步 [1.2.7]
+                        edit_w = ctx.NX;
+                        edit_h = ctx.NZ;
+
+                        // 注销并重设 OpenGL 纹理尺寸，防止显存崩溃
+                        cudaGraphicsUnregisterResource(gl.cudaSeisRes);
+                        glBindTexture(GL_TEXTURE_2D, gl.seisTex);
+                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ctx.NX, ctx.NZ, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                        cudaGraphicsGLRegisterImage(&gl.cudaSeisRes, gl.seisTex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
+
+                        first_align_needed = true; // 视口重置吸附
+                    }
+                    ImGui::Spacing();
+
+                    // -------------------------------------------------------------
+                    // C. 外部文本模型导入 (带有用户自主控制垂直翻转开关)
+                    // -------------------------------------------------------------
+                    ImGui::Separator();
+                    ImGui::TextColored(uiAccent, "EXTERNAL MODEL IMPORT (TXT)");
+
+                    // 用户选择的 Y 轴翻转静态状态变量
+                    static bool flipImportY = false;
+                    ImGui::Checkbox("Flip Vertically on Import", &flipImportY);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Check this if your external model appears upside down.\nCommon for Python/Matlab exported data.");
                     }
 
+                    ImGui::Spacing();
+                    if (ImGui::Button("LOAD CUSTOM MODEL FILE", { -1, 35 * scale })) {
+                        char filePath[1024] = { 0 };
+                        if (OpenSystemFileDialog(filePath, sizeof(filePath))) {
+                            // 调用我们重构后的 LoadModelFromTxt，传入用户勾选的 flipImportY 开关、gl 和 state！
+                            if (LoadModelFromTxt(filePath, flipImportY, gl, state)) {
+                                popup_message = "External model loaded successfully!";
+                                show_success_popup = true;
+                            }
+                            else {
+                                popup_message = "Failed to load model file.\nPlease check file formatting or dimensions.";
+                                show_error_popup = true;
+                            }
+                        }
+                        modelStyle = 1;
+                        showGrid = false;
+                    }
+                    // =============================================================================
+                    // C. 外部标准的 SEG-Y 弹性模型组合导入控制台 [1.2.7]
+                    // =============================================================================
+                    ImGui::Separator();
+                    ImGui::TextColored(uiAccent, "EXTERNAL MODEL IMPORT (SEG-Y GROUP)");
+
+                    // 静态路径缓冲区
+                    static char vp_file_path[512] = "";
+                    static char vs_file_path[512] = "";
+                    static char rho_file_path[512] = "";
+
+                    // Vp 路径选择
+                    ImGui::InputText("Vp (.sgy)", vp_file_path, IM_ARRAYSIZE(vp_file_path));
+                    ImGui::SameLine();
+                    if (ImGui::Button("Browse##Vp", ImVec2(65 * scale, 0))) {
+                        char filePath[512] = { 0 };
+                        if (OpenSystemFileDialog(filePath, sizeof(filePath))) {
+                            strcpy_s(vp_file_path, filePath);
+                        }
+                    }
+
+                    // Vs 路径选择
+                    ImGui::InputText("Vs (.sgy)", vs_file_path, IM_ARRAYSIZE(vs_file_path));
+                    ImGui::SameLine();
+                    if (ImGui::Button("Browse##Vs", ImVec2(65 * scale, 0))) {
+                        char filePath[512] = { 0 };
+                        if (OpenSystemFileDialog(filePath, sizeof(filePath))) {
+                            strcpy_s(vs_file_path, filePath);
+                        }
+                    }
+
+                    // Rho 密度路径选择
+                    ImGui::InputText("Rho(.sgy)", rho_file_path, IM_ARRAYSIZE(rho_file_path));
+                    ImGui::SameLine();
+                    if (ImGui::Button("Browse##Rho", ImVec2(65 * scale, 0))) {
+                        char filePath[512] = { 0 };
+                        if (OpenSystemFileDialog(filePath, sizeof(filePath))) {
+                            strcpy_s(rho_file_path, filePath);
+                        }
+                    }
+
+                    // 垂直翻转开关
+                    static bool flipSegyY = true;
+                    static bool flipSegyX = false; // <-- 新增：导入水平翻转复选框
+                    ImGui::Checkbox("Flip Vertically on SEGY Import", &flipSegyY);
+                    ImGui::Checkbox("Flip Horizontally on SEGY Import", &flipSegyX);
+                    ImGui::Spacing();
+
+                    // 按钮执行加载
+                    if (ImGui::Button("LOAD SEGY MODEL GROUP", { -1, 35 * scale })) {
+                        // 确保用户选择了全部三个物性文件
+                        if (strlen(vp_file_path) > 0 && strlen(vs_file_path) > 0 && strlen(rho_file_path) > 0) {
+                            // 传入新参数 flipSegyX！
+                            if (LoadModelFromSegy(vp_file_path, vs_file_path, rho_file_path, flipSegyY, flipSegyX, gl, state)) {
+                                popup_message = "SEGY Model Group loaded successfully!";
+                                show_success_popup = true;
+                            }
+                            else {
+                                popup_message = "Failed to load SEGY files.\nPlease check file formatting or grid dimensions.";
+                                show_error_popup = true;
+                            }
+                        }
+                        else {
+                            popup_message = "Error: Please select all three SGY files (Vp, Vs, Rho)!";
+                            show_error_popup = true;
+                        }
+                        modelStyle = 1;
+                        showGrid = false;
+                    }
+                    ImGui::Spacing();
+                    // =============================================================================
+                    // D. 导出当前场景中的非均匀地层模型为标准的 SEG-Y 文件群 [1.2.7]
+                    // =============================================================================
+                    ImGui::Separator();
+                    ImGui::TextColored(uiAccent, "EXPORT CURRENT MODEL TO SEG-Y GROUP");
+
+                    static bool export_density_gcm3 = true; // 默认以 g/cm3 格式导出密度
+                    static bool export_flip_x = false;     // <-- 新增：导出水平翻转复选框
+                    ImGui::Checkbox("Convert Density to g/cm3 on Export", &export_density_gcm3);
+                    ImGui::Checkbox("Flip Horizontally on Export", &export_flip_x);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Check to convert Rho from kg/m3 (e.g. 2200) to g/cm3 (e.g. 2.2) on export.");
+                    }
+
+                    ImGui::Spacing();
+
+                    // 亮荧光色导出按钮
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(uiAccent.x * 0.15f, uiAccent.y * 0.45f, uiAccent.z * 0.55f, 0.75f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(uiAccent.x * 0.2f, uiAccent.y * 0.65f, uiAccent.z * 0.75f, 0.9f));
+                    if (ImGui::Button("EXPORT SEG-Y GROUP", { -1, 35 * scale })) {
+                        char savePath[512] = { 0 };
+                        if (SaveSystemFileDialog(savePath, sizeof(savePath))) {
+                            // 调用导出驱动
+                            if (ExportModelToSegy(savePath, export_density_gcm3, export_flip_x)) {
+                                popup_message = "SEGY Model Group exported successfully!";
+                                show_success_popup = true;
+                            }
+                            else {
+                                popup_message = "Failed to export model.\nPlease check target path permissions.";
+                                show_error_popup = true;
+                            }
+                        }
+                    }
+                    ImGui::PopStyleColor(2);
+ 
+                    ImGui::Spacing();
+                    ImGui::PopStyleColor(2);
                     ImGui::EndTabItem();
                 }
 
-                if (ImGui::BeginTabItem("vis")) {
+                if (ImGui::BeginTabItem("visual")) {
                     ImGui::Spacing();
                     ImGui::SliderFloat("Color Gain", &color_scale, 1e0f, 1e3f, "%.1f");
                     const char* components[] = { "Vz (Vertical)", "Vx (Horizontal)" };
                     ImGui::Combo("Show Component", &show_component, components, IM_ARRAYSIZE(components));
-                   
+
                     ImGui::Spacing();
                     const char* style_types[] = { "Magma Glow ", "3D Specular Coolwarm", "Neon Bipolar" };
                     ImGui::Combo("Visual Style", &waveStyle, style_types, IM_ARRAYSIZE(style_types));
                     ImGui::Spacing();
+
+                    // =================================================================
+                    // 【新增】：地质模型背景切换控件 [1.2.7]
+                    // =================================================================
+                    const char* model_styles[] = { "Titanium Grey", "Geological Map", "Grayscale Vp", "Viridis Colormap", "Cyber Neon" };
+                    ImGui::Combo("Geological Background", &modelStyle, model_styles, IM_ARRAYSIZE(model_styles));
+                    ImGui::Spacing();
+                    // =================================================================
+                    // 【新增】：背景网格线与发光矩阵交点小圆点的实时控制开关 [1.2.7]
+                    // =================================================================
+                    ImGui::Checkbox("Show Background Grid & Dots", &showGrid);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Toggle the visibility of the Symmetric Titanium grid lines and glowing intersection dots.");
+                    }
 
                     ImGui::EndTabItem();
                 }
@@ -1125,7 +1892,6 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
             ImGui::Separator();
             ImGui::TextColored(uiAccent, "EXECUTION CONTROLS");
 
-            // A. 运行暂停键 (带绿/黄动态变色)
             if (state.running) {
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.6f, 0.1f, 0.85f));
                 if (ImGui::Button("PAUSE SIMULATION", { -1, 30 * scale })) {
@@ -1141,24 +1907,19 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
                 ImGui::PopStyleColor();
             }
 
-            // B. 重置物理场模拟
             if (ImGui::Button("RESET SIMULATION", { -1, 28 * scale })) {
-                g_resetSimRequested = true; // 发射重置模拟信号
+                g_resetSimRequested = true;
             }
 
-            // C. 【视图重置 (RESET VIEWPORT) 按钮回归】：一键吸附并校准回左上角
             if (ImGui::Button("RESET VIEWPORT", { -1, 28 * scale })) {
-                g_resetViewportRequested = true; // 发射重置视口信号
+                g_resetViewportRequested = true;
             }
 
-            // D. 全局 UI 荧光主题色选择器
             ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 55 * scale);
+            float avail_w = ImGui::GetContentRegionAvail().x;
+            float reset_btn_w = 60.0f * scale;
+            float picker_w = avail_w - reset_btn_w - ImGui::GetStyle().ItemSpacing.x;
 
-            float avail_w = ImGui::GetContentRegionAvail().x;   // 获取当前窗口的总可用宽度
-            float btn_w = 60.0f * scale;                        // 设定 Reset 按钮宽度
-            float picker_w = avail_w - btn_w - ImGui::GetStyle().ItemSpacing.x; // 计算选择器宽度
-
-            // A. 左侧：颜色选择器 (限制宽度为 picker_w)
             ImGui::PushItemWidth(picker_w);
             ImGui::ColorEdit3("##AccentColorPicker", (float*)&uiAccent, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_PickerHueBar);
             ImGui::PopItemWidth();
@@ -1166,23 +1927,17 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
                 ImGui::SetTooltip("Interface Hue Accent Color");
             }
 
-            // 同行并排放置
             ImGui::SameLine();
 
-            // B. 右侧：重置按钮 (自动继承当前的 uiAccent 荧光变色，保持视觉高度统一)
-            if (ImGui::Button("Reset##Theme", ImVec2(btn_w, 0))) {
+            if (ImGui::Button("Reset##Theme", ImVec2(reset_btn_w, 0))) {
                 uiAccent = ImVec4(0.5f, 1.0f, 0.5f, 1.0f); // 默认绿色荧光;
             }
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Reset UI Accent Color to Default Cyan");
             }
-
-            
-
         }
         ImGui::End();
 
-        // 统一弹出样式，避免状态污染
         ImGui::PopStyleVar(2);
         ImGui::PopStyleColor(8);
     }
@@ -1194,7 +1949,6 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
         ImGui::SetNextWindowPos({ 0, (float)winH - barHeight });
         ImGui::SetNextWindowSize({ (float)winW, barHeight });
 
-        // 计算动态微暗底色 (背景有淡淡的主题色微光) [1.1.3]
         ImVec4 botBarBg = ImVec4(0.95f, 1.0f, 0.98f, 0.2f);
         ImGui::PushStyleColor(ImGuiCol_WindowBg, botBarBg);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
@@ -1204,23 +1958,21 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
         {
             float centerY = 14.0f * scale;
 
-            // A. 左侧：当前鼠标下的网格与物理位置
             ImGui::SetCursorPos({ 20 * scale, centerY });
-            if (is_valid_grid) {
+            if (hover_valid) {
                 ImGui::TextDisabled("GRID:"); ImGui::SameLine();
-                ImGui::TextColored(uiAccent, "X:%d, Z:%d", mx, my);
+                ImGui::TextColored(uiAccent, "X:%d, Z:%d", hover_mx, hover_my);
                 ImGui::SameLine();
                 ImGui::TextDisabled("| COORD:"); ImGui::SameLine();
-                ImGui::TextColored(uiAccent, "X:%.1f m, Z:%.1f m", mx * ctx.h, my * ctx.h);
+                ImGui::TextColored(uiAccent, "X:%.1f m, Z:%.1f m", hover_mx * ctx.h, hover_my * ctx.h);
             }
             else {
                 ImGui::TextDisabled("GRID MONITOR: STANDBY (HOVER OVER WAVEFIELD)");
             }
 
-            // B. 中间：当前网格点的物性数值实时监控 (Vp, Vs, Density) [3]
             char paramStr[256];
-            if (is_valid_grid) {
-                sprintf(paramStr, "P-WAVE SPEED (Vp): %.1f m/s  |  S-WAVE SPEED (Vs): %.1f m/s  |  DENSITY (Rho): %.1f kg/m^3", h_Vp, h_Vs, h_Rho);
+            if (hover_valid) {
+                sprintf(paramStr, "P-WAVE SPEED (Vp): %.1f m/s  |  S-WAVE SPEED (Vs): %.1f m/s  |  DENSITY (Rho): %.1f kg/m^3", hover_Vp, hover_Vs, hover_Rho);
             }
             else {
                 sprintf(paramStr, "ROCK MEDIUM MONITOR: ACTIVE");
@@ -1228,18 +1980,17 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
             float textWidth = ImGui::CalcTextSize(paramStr).x;
             ImGui::SetCursorPos({ (winW - textWidth) * 0.5f, centerY });
 
-            if (is_valid_grid) {
+            if (hover_valid) {
                 ImGui::TextColored(uiAccent, "%s", paramStr);
             }
             else {
                 ImGui::TextDisabled("%s", paramStr);
             }
 
-            // C. 右侧：系统状态指示
             float rightSectionWidth = 220.0f * scale;
             ImGui::SetCursorPos({ (float)winW - rightSectionWidth, centerY });
             ImGui::TextDisabled("STATUS:"); ImGui::SameLine();
-            if (is_valid_grid) {
+            if (hover_valid) {
                 ImGui::TextColored({ 0.2f, 1.0f, 0.4f, 1.0f }, "INDEX LINKED");
             }
             else {
@@ -1250,7 +2001,6 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
         ImGui::PopStyleVar(2);
         ImGui::PopStyleColor(1);
 
-        // --- 底部栏顶部的荧光细线 ---
         ImDrawList* botDraw = ImGui::GetForegroundDrawList();
         botDraw->AddLine(
             { 0, (float)winH - barHeight },
@@ -1260,3 +2010,23 @@ void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl,
         );
     }
 }
+// =============================================================================
+// 9. 主接口：重构后的超精简总调度器 (RenderSeisSimScreen_GPU)
+// =============================================================================
+inline void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl, const GpuInfo& info) {
+    const float scale = (float)winW / 1920.0f;
+    const float barHeight = 48.0f * scale;
+
+    InitializeSeismicSimulation(gl);
+
+    ApplyCameraAutoAlignment(winW, winH, barHeight);
+
+    HandleSeismicInteractions(state, winW, winH, barHeight);
+
+    UpdateWavefieldSimulation(state);
+
+    RenderFullBackbufferWavefield(winW, winH, barHeight, gl);
+
+    RenderSeisHUD(state, winW, winH, barHeight, scale, gl, info);
+}
+//这是你之前给我的完整代码，已经非常完美了。现在请结合之前那个“不需要引入模拟中心，上面为地表”的片段着色器，进行完整的代码编译。检查是否有没写完或缺失定义的地方。

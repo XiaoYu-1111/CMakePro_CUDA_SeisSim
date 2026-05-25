@@ -55,7 +55,7 @@ add_executable(${TARGET_NAME}
     ${CUDA_USER_SOURCES}
     ${CUDA_USER_HEADERS}
     "Main_header/Common.h"
-)
+    "Main_cpp/SeismicIO.cpp")
 
 # ==========================================
 # 5. 编译选项与标准设置

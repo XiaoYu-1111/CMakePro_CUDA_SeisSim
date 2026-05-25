@@ -2636,19 +2636,19 @@ void CheckIdleStatus(GLFWwindow* window, SimState& state) {
         inputDetected = true;
     }
 
-    // 4. 更新状态
-    if (inputDetected) {
-        state.lastInputTime = currentTime;
-    }
-    else {
-        // 如果正在运行模拟，且超过了空闲时间
-        if (!state.isIntroMode && (currentTime - state.lastInputTime > state.idleTimeout)) {
-            state.isIntroMode = true; // 自动进入屏保/欢迎页
-            state.running = false;    // 可选：暂停模拟以省电
-            //state.RenderVisualization = false; // 可选：关闭渲染
-            std::cout << "[System] Idle timeout reached. Returning to Intro Screen." << std::endl;
-        }
-    }
+    //// 4. 更新状态
+    //if (inputDetected) {
+    //    state.lastInputTime = currentTime;
+    //}
+    //else {
+    //    // 如果正在运行模拟，且超过了空闲时间
+    //    if (!state.isIntroMode && (currentTime - state.lastInputTime > state.idleTimeout)) {
+    //        state.isIntroMode = true; // 自动进入屏保/欢迎页
+    //        state.running = false;    // 可选：暂停模拟以省电
+    //        //state.RenderVisualization = false; // 可选：关闭渲染
+    //        std::cout << "[System] Idle timeout reached. Returning to Intro Screen." << std::endl;
+    //    }
+    //}
 }
 
 //资源清理
