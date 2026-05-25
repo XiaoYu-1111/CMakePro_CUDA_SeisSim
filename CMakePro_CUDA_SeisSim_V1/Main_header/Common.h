@@ -325,3 +325,35 @@ enum SceneType {
     SCENE_REFRACTION,          // 线性连续速度梯度 (折射回转波)
     SCENE_PENROSE_ROOM         // 彭罗斯椭圆房间 (波场双焦收敛)
 };
+
+// 二维地震道分析状态结构体
+struct AnalysisState {
+    bool isOpen = false;
+    int numChannels = 0;                         // 检波器道数 (nTraces)
+    int numSamples = 0;                          // 每道采样点数 (nSamples)
+    float globalMaxAmp = 0.0f;                   // 全局最大振幅
+    float samplingInterval = 0.001f;             // 自动提取的物理采样率 dt (秒)
+
+    std::vector<std::vector<float>> traces;      // 二阶地震道数据 [channel][sample]
+    std::vector<float> heatmapData;              // 展平的单维 Heatmap 矩阵
+
+    bool showWiggle = true;                      // 是否绘制 Wiggle 细线
+    bool showHeatmap = true;                     // 是否绘制 Heatmap 背景
+    int colormapIndex = 0;                       // 颜色图谱索引 (0: RdBu, 1: PiYG, 2: Spectral)
+    ImVec4 colorLine = ImVec4(0.0f, 0.0f, 0.0f, 1.0f); // Wiggle 线的颜色 (默认黑色)
+    float displayGain = 1.0f;                    // 振幅显示增益
+    float heatmapMin = -1.0f;
+    float heatmapMax = 1.0f;
+    bool fitRequest = false;                     // 一键重置轴视角请求
+};
+
+struct PlotContext {
+    const std::vector<float>* traceData;
+    float offsetX;
+    float gain;
+    float dt;
+    bool useTime;
+    int startSample;
+    int step;
+};
+

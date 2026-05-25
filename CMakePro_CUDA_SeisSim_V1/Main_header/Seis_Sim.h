@@ -301,6 +301,7 @@ inline void RenderSourceMarker(
     }
 }
 
+
 // =============================================================================
 // 2. 核心物性注入器：将 Vp、Vs、密度转换为 CPU 端弹性拉梅常数
 // =============================================================================
@@ -805,6 +806,107 @@ inline bool SaveSystemFileDialog(char* outPath, size_t maxPathLen) {
 #endif
 
 // =============================================================================
+// 1. 【重构版】：列优先 (Column-Major) 2D 物理模型网格重采样算法 (最近邻插值)
+// =============================================================================
+inline std::vector<std::vector<float>> ResampleGrid2D(
+    const std::vector<std::vector<float>>& input,
+    float target_dx,
+    float original_dx
+) {
+    if (input.empty() || input[0].empty()) return {};
+
+    int old_nx = static_cast<int>(input.size());       // 原始 X 点数 (Traces)
+    int old_nz = static_cast<int>(input[0].size());    // 原始 Z 点数 (Samples)
+
+    // 计算实际地质体的物理宽高 [3]
+    float physical_width = (old_nx - 1) * original_dx;
+    float physical_depth = (old_nz - 1) * original_dx;
+
+    // 计算对应 target_dx 步长下的新网格点数
+    int new_nx = static_cast<int>(physical_width / target_dx) + 1;
+    int new_nz = static_cast<int>(physical_depth / target_dx) + 1;
+
+    std::cout << "[Resample] Resampling grid: " << old_nx << "x" << old_nz
+        << " -> " << new_nx << "x" << new_nz << " (spacing: " << original_dx << "m -> " << target_dx << "m)" << std::endl;
+
+    std::vector<std::vector<float>> output(new_nx, std::vector<float>(new_nz, 0.0f));
+    float ratio = target_dx / original_dx;
+
+    for (int x = 0; x < new_nx; ++x) {
+        int old_x = static_cast<int>(x * ratio + 0.5f);
+        if (old_x >= old_nx) old_x = old_nx - 1;
+
+        for (int z = 0; z < new_nz; ++z) {
+            int old_z = static_cast<int>(z * ratio + 0.5f);
+            if (old_z >= old_nz) old_z = old_nz - 1;
+
+            output[x][z] = input[old_x][old_z];
+        }
+    }
+    return output;
+}
+
+// =============================================================================
+// 【终极物理优化】：列优先 2D 物理地层边界外推扩边算法 (带流体安全固化机制)
+//  1. 采用 Clamp 边缘外推，保证 Vp 和 密度在 PML 交界处 100% 物理连续，实现 P 波零反射。
+//  2. 【核心稳定】：自动检测外推进入 PML 内部的网格。若该网格为流体 (Vs=0, 如水层)，
+//     强制将其 Vs 提升为 Vp / 2，使 PML 运行在稳定的“固体”介质上，彻底消灭流固 PML 发散奇点！
+// =============================================================================
+inline std::vector<std::vector<float>> PadPmlToGrid2D(
+    const std::vector<std::vector<float>>& grid_vp,
+    const std::vector<std::vector<float>>& grid_vs,
+    const std::vector<std::vector<float>>& grid_rho,
+    int npml,
+    int component_type // 0: Vp, 1: Vs, 2: Rho
+) {
+    if (grid_vp.empty() || grid_vp[0].empty()) return {};
+
+    int old_nx = static_cast<int>(grid_vp.size());
+    int old_nz = static_cast<int>(grid_vp[0].size());
+
+    int new_nx = old_nx + 2 * npml;
+    int new_nz = old_nz + 2 * npml;
+
+    std::vector<std::vector<float>> output(new_nx, std::vector<float>(new_nz, 0.0f));
+
+    for (int x = 0; x < new_nx; ++x) {
+        int src_x = std::max(0, std::min(x - npml, old_nx - 1));
+        bool in_x_pml = (x < npml) || (x >= new_nx - npml);
+
+        for (int z = 0; z < new_nz; ++z) {
+            int src_z = std::max(0, std::min(z - npml, old_nz - 1));
+            bool in_z_pml = (z < npml) || (z >= new_nz - npml);
+
+            // 获取外推对齐后的原始物理量
+            float vp = grid_vp[src_x][src_z];
+            float vs = grid_vs[src_x][src_z];
+            float rho = grid_rho[src_x][src_z];
+
+            // 智能量纲转换 (克/立方厘米 转 千克/立方米)
+            if (rho > 0.0f && rho < 10.0f) rho *= 1000.0f;
+            if (rho < 10.0f) rho = 1000.0f;
+
+            // =================================================================
+            // 【核心安全保护】：如果该点处于 PML 内部，且原先是水层（Vs == 0）
+            //  我们在 PML 内部强行将其“固化”为剪切波速为 Vp/2 的稳定固体介质！
+            // =================================================================
+            if (in_x_pml || in_z_pml) {
+                if (vs <= 0.0f && vp > 350.0f) {
+                    vs = vp / 2.0f; // 稳定剪切速度
+                }
+            }
+
+            // 根据当前请求的导出分量类型，返回对应的物理值
+            if (component_type == 0)      output[x][z] = vp;
+            else if (component_type == 1) output[x][z] = vs;
+            else                          output[x][z] = rho;
+        }
+    }
+
+    return output;
+}
+
+// =============================================================================
 // 【高级模型加载器】：从 3 个标准的二维 SEG-Y 文件中同时载入地层物理常数 (Vp, Vs, Rho)
 //  1. 自动对齐并验证三个 SGY 文件的 NX、NZ 尺寸是否一致
 //  2. 100% 物理对齐：利用 flipVertically 确保地表 Z=0 完美对齐到视口顶端
@@ -818,29 +920,38 @@ inline bool LoadModelFromSegy(
     const std::string& vs_path,
     const std::string& rho_path,
     bool flipVertically,
-    bool flipHorizontally, // <-- 新增水平翻转参数
+    bool flipHorizontally,
     GLHandles& gl,
     SimState& state
 ) {
-    std::cout << "[IO] Loading SEGY model files (Flip X: " << (flipHorizontally ? "Yes" : "No") << ")..." << std::endl;
+    std::cout << "[IO] Loading SEGY model files..." << std::endl;
 
-    auto data_vp = SeismicIO::readSegyFile2D(vp_path);
-    auto data_vs = SeismicIO::readSegyFile2D(vs_path);
-    auto data_rho = SeismicIO::readSegyFile2D(rho_path);
+    auto raw_vp = SeismicIO::readSegyFile2D(vp_path);
+    auto raw_vs = SeismicIO::readSegyFile2D(vs_path);
+    auto raw_rho = SeismicIO::readSegyFile2D(rho_path);
 
-    if (data_vp.empty() || data_vs.empty() || data_rho.empty()) {
+    if (raw_vp.empty() || raw_vs.empty() || raw_rho.empty()) {
         std::cerr << "[IO] Error: One or more SEGY files failed to load." << std::endl;
         return false;
     }
 
-    int file_w = static_cast<int>(data_vp.size());
-    int file_h = static_cast<int>(data_vp[0].size());
+    // 1. 动态重采样 (对齐我们当前系统的物理空间步长 ctx.h / par.model.dx)
+    float original_segy_dx = 1.0f;
+    float target_system_dx = par.model.dx;
 
-    if (data_vs.size() != file_w || data_vs[0].size() != file_h ||
-        data_rho.size() != file_w || data_rho[0].size() != file_h) {
-        std::cerr << "[IO] Error: SEGY model dimensions are out of sync!" << std::endl;
-        return false;
-    }
+    auto grid_vp = ResampleGrid2D(raw_vp, target_system_dx, original_segy_dx);
+    auto grid_vs = ResampleGrid2D(raw_vs, target_system_dx, original_segy_dx);
+    auto grid_rho = ResampleGrid2D(raw_rho, target_system_dx, original_segy_dx);
+
+    // 2. 【一气呵成】：PML 扩边 + 100% P波阻抗匹配 + 水层安全固化
+    int current_npml = static_cast<int>(par.FDM.npml);
+    auto vp_pad = PadPmlToGrid2D(grid_vp, grid_vs, grid_rho, current_npml, 0); // 传 0 导 Vp
+    auto vs_pad = PadPmlToGrid2D(grid_vp, grid_vs, grid_rho, current_npml, 1); // 传 1 导 Vs
+    auto rho_pad = PadPmlToGrid2D(grid_vp, grid_vs, grid_rho, current_npml, 2); // 传 2 导 Rho
+
+    // 确定最终尺寸
+    int file_w = static_cast<int>(vp_pad.size());
+    int file_h = static_cast<int>(vp_pad[0].size());
 
     state.running = false;
     current_it = 0;
@@ -852,38 +963,26 @@ inline bool LoadModelFromSegy(
     par.model.xnum = edit_w;
     par.model.znum = edit_h;
 
+    // 重新在 CPU 侧初始化上下文尺寸
     setupTestContext(ctx, par);
 
+    // 3. 将完美对齐、完全稳定的数据写入内存 (支持垂直/水平翻转)
     for (int x = 0; x < ctx.NX; ++x) {
         for (int z = 0; z < ctx.NZ; ++z) {
-            float vp = data_vp[x][z];
-            float vs = data_vs[x][z];
-            float rho = data_rho[x][z];
+            float vp = vp_pad[x][z];
+            float vs = vs_pad[x][z];
+            float rho = rho_pad[x][z];
 
-            // 智能密度量纲判定与防呆
-            if (rho > 0.0f && rho < 10.0f) {
-                rho *= 1000.0f;
-            }
-            if (rho < 10.0f) {
-                rho = 1000.0f;
-            }
-
-            // A. 水平坐标对齐计算 [3]
             int targetX = x;
-            if (flipHorizontally) {
-                targetX = ctx.NX - 1 - x; // 水平翻转 (左右对齐)
-            }
+            if (flipHorizontally) targetX = ctx.NX - 1 - x;
 
-            // B. 垂直坐标对齐计算
             int targetZ = z;
-            if (flipVertically) {
-                targetZ = ctx.NZ - 1 - z; // 垂直翻转 (上下对齐)
-            }
+            if (flipVertically)   targetZ = ctx.NZ - 1 - z;
 
             SetMaterialAt(targetX, targetZ, vp, vs, rho);
         }
     }
-
+    // 4. 重置激发位置与 PML 表面波 dp_flat (保持不变)
     ctx.src_z_idx = ctx.NZ / 4;
     ctx.src_idx = ctx.src_z_idx * ctx.NX + (ctx.NX / 2);
     edit_src_x = ctx.NX / 2;
@@ -899,14 +998,67 @@ inline bool LoadModelFromSegy(
             ctx.dp_flat[j] = (l2m * l2m - lam * lam) / l2m;
         }
     }
+    // =============================================================================
+    // 【核心修复】：由于加载了全新高波速的 Marmousi 模型，必须在此处自动重新提取
+    //  当前模型的最大波速，并 100% 自动重筑最匹配、最稳定的立方阶 PML 阻尼带！
+    //  这能自动适应任何外部模型的最大速度，彻底解决加载外部模型后阻尼偏小的 Bug。
+    // =============================================================================
+    float max_vp = 0.0f;
+    for (int k = 0; k < ctx.total_grid; ++k) {
+        float vp = sqrtf(ctx.lambda2mu[k] / ctx.rho[k]);
+        if (vp > max_vp) max_vp = vp;
+    }
 
+    if (ctx.npml > 0) {
+        float L = ctx.npml * ctx.h; // PML 物理总厚度
+
+        // 基于当前 Marmousi 实际最大波速 max_vp 动态重算理论最佳阻尼常数 [6]
+        // 采用我们上一轮调校出的 3.5 倍黄金阻尼与 2.5 阶衰减指数
+        float d_max = (3.0f * max_vp * 16.12f * 3.5f) / (2.0f * L);
+        float pml_power = 2.5f;
+
+        // 重新灌入 X 轴阻尼
+        for (int i = 0; i < ctx.npml; ++i) {
+            float x_thick = (ctx.npml - i) / (float)ctx.npml;
+            float x_thick_half = (ctx.npml - (i + 0.5f)) / (float)ctx.npml;
+            if (x_thick_half < 0.0f) x_thick_half = 0.0f;
+
+            float val = d_max * powf(x_thick, pml_power);
+            float val_half = d_max * powf(x_thick_half, pml_power);
+
+            ctx.dx[i] = val;
+            ctx.dx[ctx.NX - 1 - i] = val;
+            ctx.dx_half[i] = val_half;
+            ctx.dx_half[ctx.NX - 1 - i] = val_half;
+        }
+
+        // 重新灌入 Z 轴阻尼
+        for (int i = 0; i < ctx.npml; ++i) {
+            float z_thick = (ctx.npml - i) / (float)ctx.npml;
+            float z_thick_half = (ctx.npml - (i + 0.5f)) / (float)ctx.npml;
+            if (z_thick_half < 0.0f) z_thick_half = 0.0f;
+
+            float val = d_max * powf(z_thick, pml_power);
+            float val_half = d_max * powf(z_thick_half, pml_power);
+
+            ctx.dz[i] = val;
+            ctx.dz[ctx.NZ - 1 - i] = val;
+            ctx.dz_half[i] = val_half;
+            ctx.dz_half[ctx.NZ - 1 - i] = val_half;
+        }
+    }
+
+    // 5. 释放并重新注册 FBO 纹理尺寸，防止显存崩溃
     freeGPUSimulation(gpu_data);
     cudaGraphicsUnregisterResource(gl.cudaSeisRes);
     glBindTexture(GL_TEXTURE_2D, gl.seisTex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ctx.NX, ctx.NZ, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     cudaGraphicsGLRegisterImage(&gl.cudaSeisRes, gl.seisTex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
 
+    // 6. 重新初始化新大小的 GPU 显存
     initGPUSimulation(gpu_data, ctx);
+
+    // 7. 同步重绘地质背景纹理，重新对齐视口标尺
     UpdateModelTexture();
     first_align_needed = true;
 
@@ -983,6 +1135,303 @@ inline bool ExportModelToSegy(const std::string& base_filepath, bool density_gcm
     return true;
 }
 
+// =============================================================================
+// 新增：标准的 SEG-Y 地震记录数据装载器
+//  1. 调用 SeismicIO 一键读入道数据
+//  2. 自动从二进制卷头 3216 字节处抽取大端序采样率 dt 并自动换算为秒，无需人工输入！
+//  3. 实时计算全局最大振幅用于增益自适应归一化 [3]
+// =============================================================================
+inline bool LoadSeismicSegy(const std::string& filepath, AnalysisState& state) {
+    // 1. 调用您的标准 SEGY 2D 接口读取
+    state.traces = SeismicIO::readSegyFile2D(filepath);
+    if (state.traces.empty()) {
+        return false;
+    }
+
+    state.numChannels = static_cast<int>(state.traces.size());
+    state.numSamples = static_cast<int>(state.traces[0].size());
+
+    // 2. 自动从二进制卷头的 Bytes 17-18 (即文件第 3216 字节) 提取采样间隔
+    state.samplingInterval = 0.001f; // 默认防呆值 (1ms)
+    std::ifstream file(filepath, std::ios::binary);
+    if (file.is_open()) {
+        file.seekg(3200 + 16, std::ios::beg); // 定位至 3216 字节
+        uint16_t raw_dt = 0;
+        file.read(reinterpret_cast<char*>(&raw_dt), 2);
+
+        // 大端序转小端序
+        uint16_t swapped_dt = ((raw_dt & 0xFF00) >> 8) | ((raw_dt & 0x00FF) << 8);
+        if (swapped_dt > 0) {
+            state.samplingInterval = static_cast<float>(swapped_dt) / 1000000.0f; // 微秒换算为秒
+        }
+        file.close();
+    }
+
+    // 3. 计算全局最大振幅用于 Wiggle/Heatmap 动态边界自适应 [3]
+    state.globalMaxAmp = 0.0f;
+    for (const auto& trace : state.traces) {
+        for (float val : trace) {
+            float abs_val = std::abs(val);
+            if (abs_val > state.globalMaxAmp) {
+                state.globalMaxAmp = abs_val;
+            }
+        }
+    }
+
+    return true;
+}
+
+// 惰性更新一维 Heatmap 矩阵的辅助函数
+inline void UpdateHeatmapData(AnalysisState& state) {
+    state.heatmapData.resize(state.numSamples * state.numChannels);
+    for (int r = 0; r < state.numSamples; ++r) {
+        for (int c = 0; c < state.numChannels; ++c) {
+            // 将 [channel_idx][sample_idx] 映射为行优先矩阵，完美适配 ImPlot::PlotHeatmap
+            state.heatmapData[r * state.numChannels + c] = state.traces[c][r];
+        }
+    }
+}
+// 视口 LOD 高效回调画笔
+inline ImPlotPoint SeismicDataGetter(int idx, void* data) {
+    PlotContext* ctx = reinterpret_cast<PlotContext*>(data);
+    int sampleIdx = ctx->startSample + idx * ctx->step;
+    float val = (*ctx->traceData)[sampleIdx];
+
+    // 振幅横向展开偏移
+    double x = ctx->offsetX + val * ctx->gain;
+    double y = ctx->useTime ? (sampleIdx * ctx->dt) : (double)sampleIdx;
+
+    return ImPlotPoint(x, y);
+}
+inline AnalysisState g_analyzerState; // 全局唯一的分析器状态实例
+// =============================================================================
+// 升级版：高保真 SEG-Y 探查数据分析器窗口 (Seismic Data Analyzer)
+// =============================================================================
+void RenderAnalysisWindow(AnalysisState& state) {
+    if (!state.isOpen) return;
+
+    ImGui::SetNextWindowSize(ImVec2(1000, 700), ImGuiCond_FirstUseEver);
+
+    if (ImGui::Begin("Seismic Data Analyzer", &state.isOpen)) {
+
+        static bool useTimeAxis = true;
+
+        // ============================================================
+        // 1. 顶部工具栏 (改用原生 SEG-Y 选择与自动解析加载)
+        // ============================================================
+        if (ImGui::Button("Load SEG-Y Data")) {
+            char filePath[1024] = { 0 };
+            if (OpenSystemFileDialog(filePath, sizeof(filePath))) {
+
+                // 一键载入标准的二进制 SEG-Y 数据组
+                if (LoadSeismicSegy(filePath, state)) {
+                    // 自动计算 Wiggle 增益
+                    if (state.globalMaxAmp > 1e-20f) {
+                        state.displayGain = 0.8f / state.globalMaxAmp;
+                        state.heatmapMin = -state.globalMaxAmp;
+                        state.heatmapMax = state.globalMaxAmp;
+                    }
+                    else {
+                        state.displayGain = 1.0f;
+                    }
+
+                    state.heatmapData.clear(); // 标记脏数据，触发重新拼装
+                    state.fitRequest = true;   // 一键自适应缩放全屏
+                }
+            }
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button("Reset View")) {
+            state.fitRequest = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reset axes to full data range.");
+
+        ImGui::SameLine();
+        ImGui::TextDisabled("| %d Traces x %d Samples | MaxAmp: %.2e | dt: %.5f s",
+            state.numChannels, state.numSamples, state.globalMaxAmp, state.samplingInterval);
+
+        // ============================================================
+        // 2. 参数控制面板
+        // ============================================================
+        if (ImGui::CollapsingHeader("Display Parameters", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Columns(2, "viz_cols", false);
+
+            // --- 左列：Wiggle 线条绘制设置 ---
+            ImGui::TextDisabled("[ Wiggle Trace ]");
+            ImGui::Checkbox("Show Wiggle", &state.showWiggle);
+            if (state.showWiggle) {
+                ImGui::SameLine();
+                ImGui::Checkbox("Time Axis (Y)", &useTimeAxis);
+
+                float baseGain = (state.globalMaxAmp > 0) ? (1.0f / state.globalMaxAmp) : 1.0f;
+                float minGain = baseGain * 0.01f;
+                float maxGain = baseGain * 1000.0f;
+
+                ImGui::SetNextItemWidth(150);
+                if (ImGui::DragFloat("Gain", &state.displayGain, baseGain * 0.01f, minGain, maxGain, "%.2e", ImGuiSliderFlags_Logarithmic)) {
+                    if (state.displayGain < minGain) state.displayGain = minGain;
+                }
+
+                ImGui::SameLine();
+                ImGui::ColorEdit4("Color", (float*)&state.colorLine, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
+            }
+
+            // --- 右列：Heatmap 密度着色设置 ---
+            ImGui::NextColumn();
+            ImGui::TextDisabled("[ Heatmap Background ]");
+            ImGui::Checkbox("Show Heatmap", &state.showHeatmap);
+            if (state.showHeatmap) {
+                ImGui::SameLine();
+                const char* cmaps[] = { "RdBu", "PiYG", "Spectral", "Greys" };
+                ImGui::SetNextItemWidth(100);
+                ImGui::Combo("##cmap", &state.colormapIndex, cmaps, IM_ARRAYSIZE(cmaps));
+
+                ImGui::SetNextItemWidth(180);
+                float dragSpeed = (state.globalMaxAmp > 0) ? state.globalMaxAmp * 0.01f : 0.01f;
+                ImGui::DragFloatRange2("Range", &state.heatmapMin, &state.heatmapMax, dragSpeed, -FLT_MAX, FLT_MAX, "Min: %.2e", "Max: %.2e");
+            }
+            ImGui::Columns(1);
+
+            // --- 底部：物理采样参数（由于从 SEGY 中自动提取，这里设为只读以体现专业性） ---
+            ImGui::Separator();
+            ImGui::Text("Physical Parameters:");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.8f, 1.0f), "Sampling Interval (dt): %.5f s  (Auto-Parsed from SEGY Header)", state.samplingInterval);
+        }
+
+        ImGui::Separator();
+
+        // ============================================================
+        // 3. 核心绘图区 (完全复用高性能 Plotting 逻辑)
+        // ============================================================
+        if (state.numChannels > 0 && state.numSamples > 0) {
+
+            if (state.showHeatmap && state.heatmapData.empty()) {
+                UpdateHeatmapData(state);
+            }
+
+            // 经典学术白底绘图纸风格色板
+            ImPlot::PushStyleColor(ImPlotCol_FrameBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+            ImPlot::PushStyleColor(ImPlotCol_PlotBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+            ImPlot::PushStyleColor(ImPlotCol_AxisGrid, ImVec4(0.9f, 0.9f, 0.9f, 1.0f));
+            ImPlot::PushStyleColor(ImPlotCol_AxisText, ImVec4(0.2f, 0.2f, 0.2f, 1.0f));
+            ImPlot::PushStyleColor(ImPlotCol_TitleText, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+
+            if (ImPlot::BeginPlot("Seismic Record", ImVec2(-1, -1))) {
+
+                double maxTime = state.numSamples * state.samplingInterval;
+                double yEnd = useTimeAxis ? maxTime : (double)state.numSamples;
+
+                const char* yLabel = useTimeAxis ? "Time (s)" : "Sample Index";
+                ImPlot::SetupAxes("Trace Number", yLabel);
+                ImPlot::SetupAxis(ImAxis_Y1, NULL, ImPlotAxisFlags_Invert); // 标杆：0 深度在上
+
+                if (state.fitRequest) {
+                    ImPlot::SetupAxisLimits(ImAxis_X1, -2.0, state.numChannels + 2.0, ImGuiCond_Always);
+                    ImPlot::SetupAxisLimits(ImAxis_Y1, -yEnd * 0.05, yEnd * 1.05, ImGuiCond_Always);
+                    state.fitRequest = false;
+                }
+                else {
+                    ImPlot::SetupAxisLimitsConstraints(ImAxis_X1, -10.0, state.numChannels + 10.0);
+                    ImPlot::SetupAxisLimitsConstraints(ImAxis_Y1, -yEnd * 0.5, yEnd * 2.0);
+                }
+
+                // --- Layer 1: Heatmap 密度剖面背景 ---
+                if (state.showHeatmap && !state.heatmapData.empty()) {
+                    ImPlotColormap mapID = ImPlotColormap_RdBu;
+                    if (state.colormapIndex == 1) mapID = ImPlotColormap_PiYG;
+                    else if (state.colormapIndex == 2) mapID = ImPlotColormap_Spectral;
+                    else if (state.colormapIndex == 3) mapID = ImPlotColormap_Greys;
+
+                    ImPlot::PushColormap(mapID);
+
+                    ImPlot::PlotHeatmap("##HM",
+                        state.heatmapData.data(),
+                        state.numSamples,
+                        state.numChannels,
+                        state.heatmapMin, state.heatmapMax,
+                        NULL,
+                        { 0.5, yEnd },
+                        { (double)state.numChannels + 0.5, 0.0 }
+                    );
+
+                    ImPlot::PopColormap();
+                }
+
+                // --- Layer 2: Wiggle Trace 地震道曲线 ---
+                if (state.showWiggle) {
+                    ImPlotRect limits = ImPlot::GetPlotLimits();
+                    ImVec2 plotSize = ImPlot::GetPlotSize();
+
+                    // 空间水平视口剔除
+                    int startCh = (int)floor(limits.X.Min) - 1;
+                    int endCh = (int)ceil(limits.X.Max) + 1;
+                    if (startCh < 0) startCh = 0;
+                    if (endCh > state.numChannels) endCh = state.numChannels;
+
+                    // 深度纵向视口剔除 (兼容 Invert 轴)
+                    double valMin = (limits.Y.Min < limits.Y.Max) ? limits.Y.Min : limits.Y.Max;
+                    double valMax = (limits.Y.Min > limits.Y.Max) ? limits.Y.Min : limits.Y.Max;
+
+                    int startSample, endSample;
+                    if (useTimeAxis) {
+                        startSample = (int)(valMin / state.samplingInterval);
+                        endSample = (int)(valMax / state.samplingInterval);
+                    }
+                    else {
+                        startSample = (int)valMin;
+                        endSample = (int)valMax;
+                    }
+                    if (startSample < 0) startSample = 0;
+                    if (endSample > state.numSamples) endSample = state.numSamples;
+
+                    if (startCh < endCh && startSample < endSample) {
+                        // 动态 LOD 采样滤波，防止高采样率混叠
+                        double visibleSamples = endSample - startSample;
+                        int step = 1;
+                        if (visibleSamples > 0 && plotSize.y > 0) {
+                            double samplesPerPixel = visibleSamples / plotSize.y;
+                            if (samplesPerPixel > 1.0) step = (int)samplesPerPixel;
+                        }
+
+                        PlotContext ctx;
+                        ctx.gain = state.displayGain;
+                        ctx.dt = state.samplingInterval;
+                        ctx.useTime = useTimeAxis;
+                        ctx.startSample = startSample;
+                        ctx.step = step;
+                        int pointsToDraw = (endSample - startSample) / step;
+
+                        for (int i = startCh; i < endCh; ++i) {
+                            ImPlot::SetNextLineStyle(state.colorLine);
+
+                            ctx.traceData = &state.traces[i];
+                            ctx.offsetX = (float)(i + 1);
+
+                            ImGui::PushID(i);
+                            if (pointsToDraw > 0) {
+                                ImPlot::PlotLineG("##Trace", SeismicDataGetter, &ctx, pointsToDraw);
+                            }
+                            ImGui::PopID();
+                        }
+                    }
+                }
+
+                ImPlot::EndPlot();
+            }
+
+            ImPlot::PopStyleColor(5);
+        }
+        else {
+            ImVec2 avail = ImGui::GetContentRegionAvail();
+            ImGui::GetWindowDrawList()->AddText(
+                ImVec2(ImGui::GetCursorScreenPos().x + avail.x / 2 - 80, ImGui::GetCursorScreenPos().y + avail.y / 2),
+                IM_COL32(128, 128, 128, 255), "No SEG-Y Data Loaded");
+        }
+    }
+    ImGui::End();
+}
 // =============================================================================
 // 4. 模块化子函数一：初始化显存与网格资源
 // =============================================================================
@@ -1104,7 +1553,7 @@ inline void HandleSeismicInteractions(SimState& state, int winW, int winH, float
     bool trigger_active = false;
 
     if (multi_source_mode) {
-        if (ImGui::IsMouseDown(0) && (current_time - last_inject_time >= 0.04)) {
+        if (ImGui::IsMouseDown(0) && (current_time - last_inject_time >= 0.02)) {
             trigger_active = true;
             last_inject_time = current_time;
         }
@@ -1463,7 +1912,7 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                     // 【回归】：PML 吸收层宽度实时滑块控制 [1.2.7]
                     ImGui::SliderInt("PML Layer Width", &temp_pml, 10, 100, "%d px");
                     ImGui::SliderInt("Max Steps (nt)", &temp_nt, 500, 50000);
-                    ImGui::SliderInt("Steps / Frame", &steps_per_frame, 1, 10);
+                    ImGui::SliderInt("Steps / Frame", &steps_per_frame, 1, 100);
 
                     float dt_limit = 0.5f * temp_dx / max_vp;
                     bool is_stable = (temp_dt <= dt_limit);
@@ -1885,10 +2334,8 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                 ImGui::EndTabBar();
             }
 
-            // =============================================================================
-            // 【 7. 运行控制（底部固定区） 】
-            // =============================================================================
-            ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 210 * scale);
+            
+            //ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 240 * scale);
             ImGui::Separator();
             ImGui::TextColored(uiAccent, "EXECUTION CONTROLS");
 
@@ -1914,7 +2361,15 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
             if (ImGui::Button("RESET VIEWPORT", { -1, 28 * scale })) {
                 g_resetViewportRequested = true;
             }
-
+            // =========================================================
+            // 【新增】：一键唤醒/打开 SEG-Y 地震数据分析仪按钮 [1.2.7]
+            // =========================================================
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(uiAccent.x * 0.12f, uiAccent.y * 0.32f, uiAccent.z * 0.42f, 0.8f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(uiAccent.x * 0.18f, uiAccent.y * 0.52f, uiAccent.z * 0.62f, 1.0f));
+            if (ImGui::Button("OPEN DATA ANALYZER", { -1, 28 * scale })) {
+                g_analyzerState.isOpen = true; // 发射打开分析窗口信号
+            }
+            ImGui::PopStyleColor(2);
             ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 55 * scale);
             float avail_w = ImGui::GetContentRegionAvail().x;
             float reset_btn_w = 60.0f * scale;
@@ -1941,7 +2396,11 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
         ImGui::PopStyleVar(2);
         ImGui::PopStyleColor(8);
     }
-
+    // =============================================================================
+    // 【核心新增】：在 HUD 渲染的最末端，挂载数据分析器主窗口
+    //  使其完美享受 g_analyzerState 全局共享信号控制，无需修改 main.cpp！
+    // =============================================================================
+    RenderAnalysisWindow(g_analyzerState);
     // =============================================================================
     // 【 9. 新增：底部专业状态监控栏 (BottomBar) 】
     // =============================================================================

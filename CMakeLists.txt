@@ -9,10 +9,8 @@ if (POLICY CMP0141)
   set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<IF:$<AND:$<C_COMPILER_ID:MSVC>,$<CXX_COMPILER_ID:MSVC>>,$<$<CONFIG:Debug,RelWithDebInfo>:EditAndContinue>,$<$<CONFIG:Debug,RelWithDebInfo>:ProgramDatabase>>")
 endif()
 
-project ("CMakePro_CUDA")
+project ("CMakePro_CUDA_SeisSim")
 
 # 包含子项目。
-add_subdirectory ("CMakePro_CUDA_LifeGame_V2")
-
 add_subdirectory ("CMakePro_CUDA_SeisSim_V1")
 
