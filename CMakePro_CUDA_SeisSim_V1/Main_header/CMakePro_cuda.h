@@ -2561,7 +2561,6 @@ void RenderCudaDiagnosticsScreen(SimState& state, const GpuInfo& info, int winW,
     ImGui::PopStyleColor(2); // 对应 WindowBg, Border
 }
 
-
 bool IsIntroScreen(AppScreen screen) {
     return (screen == AppScreen::Intro0 || screen == AppScreen::Intro1
         || screen == AppScreen::Intro2);

@@ -1,18 +1,27 @@
 ﻿#include <iostream>
 #include <string.h>
+#include <algorithm> // 确保 std::max 可用
 
 #include "Cuda_Check.cuh"
 #include <device_launch_parameters.h>
 
 #include <thrust/reduce.h>
 #include <thrust/device_ptr.h>
-
 #include <thrust/execution_policy.h>
 
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
-// 核函数
+// 防御性定义 M_PI，防止 MSVC 环境下 math 常量未导出的编译错误
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
+
+// =============================================================================
+// 1. 基础硬件测试模块
+// =============================================================================
+
+// 加法核函数
 __global__ void vectorAddKernel(const float* a, const float* b, float* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) c[i] = a[i] + b[i];
@@ -20,15 +29,15 @@ __global__ void vectorAddKernel(const float* a, const float* b, float* c, int n)
 
 // 辅助函数：根据架构计算核心数
 int _ConvertSMVerToCores(int major, int minor) {
-    // 定义不同架构下每个 SM 包含的核心数
     switch (major) {
-    case 7: return (minor == 0 || minor == 5) ? 64 : 64;  // Volta, Turing
-    case 8: return (minor == 0) ? 64 : 128;               // Ampere (8.0=64, 8.6/8.9=128)
-    case 9: return 128;                                   // Hopper
+    case 7:  return 64; // Volta, Turing (7.0, 7.5)
+    case 8:  return (minor == 0) ? 64 : 128; // Ampere (8.0=64, 8.6/8.9=128)
+    case 9:  return 128; // Hopper
     default: return 128;
     }
 }
 
+// 获取 GPU 设备信息
 extern "C" GpuInfo GetCudaDeviceInfo() {
     GpuInfo info;
     memset(&info, 0, sizeof(info));
@@ -38,33 +47,64 @@ extern "C" GpuInfo GetCudaDeviceInfo() {
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
 
-    strncpy_s(info.name, prop.name, sizeof(info.name));
+    // 使用具有跨平台移植性的 snprintf
+    snprintf(info.name, sizeof(info.name), "%s", prop.name);
     info.computeCapabilityMajor = prop.major;
     info.computeCapabilityMinor = prop.minor;
     info.totalMem = prop.totalGlobalMem;
     info.multiProcessorCount = prop.multiProcessorCount;
     info.clockRate = prop.clockRate;
+
     // 计算核心数：SMs * CoresPerSM
     info.cudaCores = prop.multiProcessorCount * _ConvertSMVerToCores(prop.major, prop.minor);
     info.success = true;
     return info;
 }
 
+// 实现 RunCudaTest
+extern "C" bool RunCudaTest(float* h_a, float* h_b, float* h_c, int n) {
+    float* d_a = nullptr, * d_b = nullptr, * d_c = nullptr;
+    size_t bytes = n * sizeof(float);
 
-// 内部使用的随机数状态，只需初始化一次
-static curandState* d_states = nullptr;
+    if (cudaMalloc(&d_a, bytes) != cudaSuccess) return false;
+    if (cudaMalloc(&d_b, bytes) != cudaSuccess) { cudaFree(d_a); return false; }
+    if (cudaMalloc(&d_c, bytes) != cudaSuccess) { cudaFree(d_a); cudaFree(d_b); return false; }
 
-// --- [核心修复] 定义标准的核函数代替 Lambda ---
+    cudaMemcpy(d_a, h_a, bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_b, h_b, bytes, cudaMemcpyHostToDevice);
+
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    vectorAddKernel << <blocks, threads >> > (d_a, d_b, d_c, n);
+
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        cudaFree(d_a); cudaFree(d_b); cudaFree(d_c);
+        return false;
+    }
+
+    cudaMemcpy(h_c, d_c, bytes, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_a);
+    cudaFree(d_b);
+    cudaFree(d_c);
+    return true;
+}
+
+// =============================================================================
+// 2. 生命游戏模块
+// =============================================================================
+
+static curandState* d_states = nullptr; // 随机数状态缓冲区
+
 __global__ void kInitRand(curandState* states, unsigned long seed, int w, int h) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < w * h) {
-        // 每个线程初始化自己的随机数状态
         curand_init(seed, idx, 0, &states[idx]);
     }
 }
 
 extern "C" void InitCudaLife(int w, int h) {
-    if (d_states) cudaFree(d_states); // 如果已存在则释放
+    if (d_states) cudaFree(d_states);
     cudaMalloc(&d_states, w * h * sizeof(curandState));
 
     int threads = 256;
@@ -73,7 +113,6 @@ extern "C" void InitCudaLife(int w, int h) {
     cudaDeviceSynchronize();
 }
 
-// 核心：随机初始化核函数
 __global__ void kSeedKernel(uint8_t* world, curandState* states, float density, int w, int h) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < w * h) {
@@ -85,10 +124,9 @@ __global__ void kSeedKernel(uint8_t* world, curandState* states, float density, 
 extern "C" void SeedCudaLife(uint8_t* d_world, int w, int h, float density) {
     int n = w * h;
     kSeedKernel << <(n + 255) / 256, 256 >> > (d_world, d_states, density, w, h);
-    cudaDeviceSynchronize(); // 确保写完
+    cudaDeviceSynchronize();
 }
 
-// 核心：逻辑更新核函数///并行卷积算子。
 __global__ void kLifeUpdate(const uint8_t* current, uint8_t* next, float* heatMap, int w, int h, float dt,
     bool paused, float decay, int b_mask, int s_mask) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -105,7 +143,6 @@ __global__ void kLifeUpdate(const uint8_t* current, uint8_t* next, float* heatMa
             }
         }
         uint8_t alive = current[idx];
-        // 使用位运算检查规则：判断 neighbors 对应的位是否在掩码中
         if (alive) {
             next[idx] = (s_mask & (1 << neighbors)) ? 1 : 0;
         }
@@ -113,20 +150,20 @@ __global__ void kLifeUpdate(const uint8_t* current, uint8_t* next, float* heatMa
             next[idx] = (b_mask & (1 << neighbors)) ? 1 : 0;
         }
     }
-    // 热力图计算
+
     float hVal = heatMap[idx];
     if (next[idx] == 1) {
         hVal = 1.0f;
     }
     else {
-        // 使用传入的参数 decay。建议范围：0.5 (几乎无轨迹) 到 0.99 (长轨迹)
         hVal *= decay;
-        if (hVal < 0.005f) hVal = 0.0f; // 稍微调低截断值，让过渡更平滑
+        if (hVal < 0.005f) hVal = 0.0f;
     }
     heatMap[idx] = hVal;
 }
 
-extern "C" void UpdateLifeCuda(uint8_t* d_current, uint8_t* d_next, float* d_heatMap, int w, int h, float deltaTime, bool paused, float decay, int b_mask, int s_mask) {
+extern "C" void UpdateLifeCuda(uint8_t* d_current, uint8_t* d_next, float* d_heatMap, int w, int h, float deltaTime,
+    bool paused, float decay, int b_mask, int s_mask) {
     dim3 block(16, 16);
     dim3 grid((w + 15) / 16, (h + 15) / 16);
     kLifeUpdate << <grid, block >> > (d_current, d_next, d_heatMap, w, h, deltaTime, paused, decay, b_mask, s_mask);
@@ -152,27 +189,23 @@ extern "C" void MousePaintCuda(uint8_t* d_world, float* d_heat, int w, int h, in
 }
 
 extern "C" int GetPopulationCuda(uint8_t* d_world, int w, int h) {
-    // 将原始显存指针包装为 thrust 迭代器
     thrust::device_ptr<uint8_t> ptr(d_world);
-    // 执行规约求和 (1 代表活，0 代表死，求和即为总人口)
-    // 使用 thrust::plus<int>() 进行累加
     try {
         return thrust::reduce(thrust::device, ptr, ptr + (w * h), (int)0, thrust::plus<int>());
     }
     catch (...) {
-        return 0; // 防止异常
+        return 0;
     }
 }
 
-
 // =============================================================================
-// CUDA 核心核函数
+// 3. 地震数值模拟核心核函数 (波场演化)
 // =============================================================================
 
 // --- Type 1 PML Stress Update ---
 __global__ void update_type1_stress_kernel(GPUSimData g) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x; // X
-    int i = blockIdx.y * blockDim.y + threadIdx.y; // Z
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (i >= 4 && i < g.NZ - 4 && j >= 4 && j < g.NX - 4) {
         int k = i * g.NX + j;
@@ -223,7 +256,7 @@ __global__ void update_type1_velocity_kernel(GPUSimData g) {
         float inv_dt = g.inv_dt;
 
         float d_z = g.d_dz[i];
-        float d_z_h = g.d_dz_half[i];
+        float d_z_h = g.d_dz_half[i]; // 已成功修复：重新引入被删除的 d_z_h
         float d_x = g.d_dx[j];
         float d_x_h = g.d_dx_half[j];
         float cur_rho = g.d_rho[k];
@@ -249,7 +282,7 @@ __global__ void update_type1_velocity_kernel(GPUSimData g) {
         float dsigzz_dz = g.c1_h * (g.d_szz_1[k + g.NX] + g.d_szz_2[k + g.NX] - g.d_szz_1[k] - g.d_szz_2[k])
             + g.c2_h * (g.d_szz_1[k + 2 * g.NX] + g.d_szz_2[k + 2 * g.NX] - g.d_szz_1[k - g.NX] - g.d_szz_2[k - g.NX])
             + g.c3_h * (g.d_szz_1[k + 3 * g.NX] + g.d_szz_2[k + 3 * g.NX] - g.d_szz_1[k - 2 * g.NX] - g.d_szz_2[k - 2 * g.NX])
-            + g.c4_h * (g.d_szz_1[k + 4 * g.NX] + g.d_szz_2[k + 4 * g.NX] - g.d_szz_1[k - 3 * g.NX] - g.d_szz_2[k - 3 * g.NX]);
+            + g.c4_h * (g.d_szz_1[k + 4] + g.d_szz_2[k + 4] - g.d_szz_1[k - 3] - g.d_szz_2[k - 3]);
 
         float rho_avg = 0.25f * (g.d_rho[k] + g.d_rho[k + 1] + g.d_rho[k + g.NX] + g.d_rho[k + g.NX + 1]);
         g.d_vz_1[k] = (g.d_vz_1[k] * (inv_dt - d_x_h) + dsigxz_dx / rho_avg) / (inv_dt + d_x_h);
@@ -375,7 +408,6 @@ __global__ void update_type3_stress_kernel(GPUSimData g) {
         float inv_dt = g.inv_dt;
 
         if (i == g.fs_idx) {
-            // 自由边界条件
             g.d_szz_1[k] = 0.0f; g.d_szz_2[k] = 0.0f;
 
             float dvx_dx = g.c1_h * (g.d_vx_1[k + 1] + g.d_vx_2[k + 1] - g.d_vx_1[k] - g.d_vx_2[k])
@@ -396,7 +428,6 @@ __global__ void update_type3_stress_kernel(GPUSimData g) {
             g.d_sxz_2[k] = (g.d_sxz_2[k] * (inv_dt - d_z_half_val) + 0.5f * (g.d_mu[k] + g.d_mu[row_dn1 + j]) * dvx_dz) / (inv_dt + d_z_half_val);
         }
         else {
-            // 内域 PML
             float dvx_dx = g.c1_h * (g.d_vx_1[k + 1] + g.d_vx_2[k + 1] - g.d_vx_1[k] - g.d_vx_2[k])
                 + g.c2_h * (g.d_vx_1[k + 2] + g.d_vx_2[k + 2] - g.d_vx_1[k - 1] - g.d_vx_2[k - 1])
                 + g.c3_h * (g.d_vx_1[k + 3] + g.d_vx_2[k + 3] - g.d_vx_1[k - 2] - g.d_vx_2[k - 2])
@@ -429,7 +460,7 @@ __global__ void update_type3_stress_kernel(GPUSimData g) {
     }
 }
 
-// --- Type 3 Stress Mirroring (szz/sxz Antisymmetric imaging) ---
+// --- Type 3 Stress Mirroring ---
 __global__ void type3_stress_mirror_kernel(GPUSimData g) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= 4 && j < g.NX - 4) {
@@ -458,7 +489,6 @@ __global__ void update_type3_velocity_kernel(GPUSimData g) {
         int k = i * g.NX + j;
 
         if (i < g.fs_idx) {
-            // 空气层速度设为零
             g.d_vx_1[k] = 0.0f; g.d_vx_2[k] = 0.0f;
             g.d_vz_1[k] = 0.0f; g.d_vz_2[k] = 0.0f;
         }
@@ -543,7 +573,7 @@ __global__ void zero_boundary_kernel(GPUSimData g) {
     }
 }
 
-// --- Colormap Generator (For Real-Time rendering to OpenGL texture) ---
+// --- Colormap Generator ---
 __global__ void generate_colormap_kernel(GPUSimData g, uchar4* rgba_out, float scale, int component) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     int i = blockIdx.y * blockDim.y + threadIdx.y;
@@ -563,13 +593,12 @@ __global__ void generate_colormap_kernel(GPUSimData g, uchar4* rgba_out, float s
         if (norm > 1.0f) norm = 1.0f;
         if (norm < -1.0f) norm = -1.0f;
 
-        // 蓝-白-红 双极地震色谱 (Seismic Bipolar Red-White-Blue)
         unsigned char r = 255, g_val = 255, b = 255;
-        if (norm > 0.0f) { // 正振幅 -> 红色
+        if (norm > 0.0f) {
             g_val = static_cast<unsigned char>(255.0f * (1.0f - norm));
             b = static_cast<unsigned char>(255.0f * (1.0f - norm));
         }
-        else { // 负振幅 -> 蓝色
+        else {
             r = static_cast<unsigned char>(255.0f * (1.0f + norm));
             g_val = static_cast<unsigned char>(255.0f * (1.0f + norm));
         }
@@ -577,7 +606,6 @@ __global__ void generate_colormap_kernel(GPUSimData g, uchar4* rgba_out, float s
         rgba_out[k] = make_uchar4(r, g_val, b, 255);
     }
 }
-
 
 __global__ void extract_receivers_kernel(
     const float* __restrict__ vx_1, const float* __restrict__ vx_2,
@@ -600,15 +628,13 @@ __global__ void extract_receivers_kernel(
         }
     }
 }
-// =============================================================================
-// 【高级核函数】：GPU 端多震源并发实时注射 (在显存内直接计算 Ricker 振幅并加载)
-// =============================================================================
+
+// --- Multi-source Injection Kernel ---
 __global__ void inject_multi_sources_kernel(GPUSimData g, const GPUSource* d_sources, int num_sources) {
-    int r = threadIdx.x; // 因为手动点击的活跃震源一般少于 256 个，用单个 Block 的线程并发即可 [1.2.7]
+    int r = threadIdx.x;
     if (r < num_sources) {
         GPUSource src = d_sources[r];
 
-        // 在 GPU 上直接进行雷克子波公式计算
         float t_peak = 1.0f / src.f_peak;
         float x = M_PI * src.f_peak * (src.t - t_peak);
         float val = src.amp * (1.0f - 2.0f * x * x) * expf(-x * x);
@@ -617,7 +643,6 @@ __global__ void inject_multi_sources_kernel(GPUSimData g, const GPUSource* d_sou
         float force_x = sinf(g.src_angle * M_PI / 180.0f) * val * 1e7f;
         float force_z = cosf(g.src_angle * M_PI / 180.0f) * val * 1e7f;
 
-        // 根据公式类型，直接累加到对应的速度场中 [3]
         if (g.flag_type == 1 || g.flag_type == 3) {
             g.d_vx_1[src_idx] += force_x * g.dt / g.d_rho[src_idx];
             float rho_avg = 0.25f * (g.d_rho[src_idx] + g.d_rho[src_idx + 1] + g.d_rho[src_idx + g.NX] + g.d_rho[src_idx + g.NX + 1]);
@@ -664,8 +689,7 @@ void initGPUSimulation(GPUSimData& gpu, const SimulationContext& ctx) {
     CUDA_CHECK(cudaMalloc(&gpu.d_dz, ctx.NZ * sizeof(float))); CUDA_CHECK(cudaMemcpy(gpu.d_dz, ctx.dz.data(), ctx.NZ * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMalloc(&gpu.d_dz_half, ctx.NZ * sizeof(float))); CUDA_CHECK(cudaMemcpy(gpu.d_dz_half, ctx.dz_half.data(), ctx.NZ * sizeof(float), cudaMemcpyHostToDevice));
 
-    CUDA_CHECK(cudaMalloc(&gpu.d_active_sources, 200 * sizeof(GPUSource)));//分配 200 个震源大小的显存
-    
+    CUDA_CHECK(cudaMalloc(&gpu.d_active_sources, 200 * sizeof(GPUSource)));
 
     if (gpu.flag_type == 2) {
         CUDA_CHECK(cudaMalloc(&gpu.d_vx, bytes)); CUDA_CHECK(cudaMemset(gpu.d_vx, 0, bytes));
@@ -674,7 +698,6 @@ void initGPUSimulation(GPUSimData& gpu, const SimulationContext& ctx) {
         CUDA_CHECK(cudaMalloc(&gpu.d_sigmazz, bytes)); CUDA_CHECK(cudaMemset(gpu.d_sigmazz, 0, bytes));
         CUDA_CHECK(cudaMalloc(&gpu.d_sigmaxz, bytes)); CUDA_CHECK(cudaMemset(gpu.d_sigmaxz, 0, bytes));
 
-        // 临时在Host初始化Type 2参数并拷入GPU
         std::vector<float> mu_x(ctx.total_grid, 0.0f), lambda_x(ctx.total_grid, 0.0f), l2m_x(ctx.total_grid, 0.0f);
         std::vector<float> mu_z(ctx.total_grid, 0.0f), rho_xz(ctx.total_grid, 0.0f), rho_orig(ctx.total_grid, 0.0f);
         for (int i = 0; i < ctx.NZ; ++i) {
@@ -711,6 +734,12 @@ void initGPUSimulation(GPUSimData& gpu, const SimulationContext& ctx) {
     if (ctx.num_rcv > 0) {
         CUDA_CHECK(cudaMalloc(&gpu.d_rcv_grid_idx, ctx.num_rcv * sizeof(int)));
         CUDA_CHECK(cudaMemcpy(gpu.d_rcv_grid_idx, ctx.rcv_grid_idx.data(), ctx.num_rcv * sizeof(int), cudaMemcpyHostToDevice));
+
+        // 分配检波器临时单步记录缓冲区
+        CUDA_CHECK(cudaMalloc(&gpu.d_record_vx_step, ctx.num_rcv * sizeof(float)));
+        CUDA_CHECK(cudaMemset(gpu.d_record_vx_step, 0, ctx.num_rcv * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&gpu.d_record_vz_step, ctx.num_rcv * sizeof(float)));
+        CUDA_CHECK(cudaMemset(gpu.d_record_vz_step, 0, ctx.num_rcv * sizeof(float)));
     }
 }
 
@@ -721,7 +750,11 @@ void freeGPUSimulation(GPUSimData& gpu) {
     cudaFree(gpu.d_rho); cudaFree(gpu.d_mu); cudaFree(gpu.d_lambda); cudaFree(gpu.d_lambda2mu);
     cudaFree(gpu.d_dx); cudaFree(gpu.d_dx_half); cudaFree(gpu.d_dz); cudaFree(gpu.d_dz_half);
     cudaFree(gpu.d_wavelet); cudaFree(gpu.d_rcv_grid_idx);
-    cudaFree(gpu.d_active_sources);//
+    cudaFree(gpu.d_active_sources);
+
+    // 释放检波器单步记录临时缓冲区
+    cudaFree(gpu.d_record_vx_step);
+    cudaFree(gpu.d_record_vz_step);
 
     if (gpu.flag_type == 2) {
         cudaFree(gpu.d_vx); cudaFree(gpu.d_vz);
@@ -738,7 +771,6 @@ void runGPUStep(GPUSimData& gpu, int current_it, const SimulationContext& ctx, i
     dim3 block(16, 16);
     dim3 grid((gpu.NX + block.x - 1) / block.x, (gpu.NZ + block.y - 1) / block.y);
 
-    // 1. Stress Update
     if (gpu.flag_type == 1) {
         update_type1_stress_kernel << <grid, block >> > (gpu);
     }
@@ -752,7 +784,6 @@ void runGPUStep(GPUSimData& gpu, int current_it, const SimulationContext& ctx, i
         }
     }
 
-    // 2. Velocity Update
     if (gpu.flag_type == 1) {
         update_type1_velocity_kernel << <grid, block >> > (gpu);
     }
@@ -763,16 +794,12 @@ void runGPUStep(GPUSimData& gpu, int current_it, const SimulationContext& ctx, i
         update_type3_velocity_kernel << <grid, block >> > (gpu);
     }
 
-    // 3. Source Injection (完美修正：区分单点模式与多点静态无源状态)
     if (num_active_sources >= 0) {
-        // 多震源状态：只有在实际有活跃震源时才调用核函数并发注射
         if (num_active_sources > 0) {
             inject_multi_sources_kernel << <1, num_active_sources >> > (gpu, gpu.d_active_sources, num_active_sources);
         }
-        // 若 num_active_sources == 0，说明当前屏幕上没有鼠标按下的涟漪，什么都不注入，保持安静！
     }
     else {
-        // 单震源模式 (安全边界检测：当 current_it >= ctx.nt 时，停止注入单震源，防止数组越界崩溃！)
         if (current_it < ctx.nt) {
             float wavelet_val = ctx.wavelet[current_it] * 1e7f;
             float force_x = sinf(ctx.src_angle * M_PI / 180.0f) * wavelet_val;
@@ -783,7 +810,6 @@ void runGPUStep(GPUSimData& gpu, int current_it, const SimulationContext& ctx, i
         }
     }
 
-    // 4. Dirichlet boundary conditions
     int max_dim = std::max(gpu.NX, gpu.NZ);
     zero_boundary_kernel << <(max_dim + 255) / 256, 256 >> > (gpu);
 }
@@ -791,7 +817,6 @@ void runGPUStep(GPUSimData& gpu, int current_it, const SimulationContext& ctx, i
 void copyWavefieldToHost(GPUSimData& gpu, float* h_vz_out) {
     size_t bytes = gpu.total_grid * sizeof(float);
     if (gpu.flag_type == 1 || gpu.flag_type == 3) {
-        // 合并分裂场 Vx/Vz 传回 Host
         float* temp_v1 = (float*)malloc(bytes);
         float* temp_v2 = (float*)malloc(bytes);
         CUDA_CHECK(cudaMemcpy(temp_v1, gpu.d_vz_1, bytes, cudaMemcpyDeviceToHost));
@@ -806,11 +831,9 @@ void copyWavefieldToHost(GPUSimData& gpu, float* h_vz_out) {
     }
 }
 
-// 接收器数据收集：我们直接在 Host 端发起少量单点 D2H 拷贝（或者编写专用内核）
 void copyRecordFromGPU(GPUSimData& gpu, int num_rcv, int nt, int current_it, float* h_rec_vx, float* h_rec_vz) {
     if (num_rcv <= 0) return;
 
-    // 1. 让 GPU 内部线程高并发提取 100 个检波器的值
     int threads = 128;
     int blocks = (num_rcv + threads - 1) / threads;
     extract_receivers_kernel << <blocks, threads >> > (
@@ -822,13 +845,11 @@ void copyRecordFromGPU(GPUSimData& gpu, int num_rcv, int nt, int current_it, flo
         num_rcv, gpu.flag_type
         );
 
-    // 2. 仅把这几百字节（100个 float）的数据拷贝回 CPU (瞬间完成，无任何阻塞感觉)
     std::vector<float> h_step_vx(num_rcv);
     std::vector<float> h_step_vz(num_rcv);
     cudaMemcpy(h_step_vx.data(), gpu.d_record_vx_step, num_rcv * sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_step_vz.data(), gpu.d_record_vz_step, num_rcv * sizeof(float), cudaMemcpyDeviceToHost);
 
-    // 3. 填入 Host 的历史数据表中
     for (int r = 0; r < num_rcv; ++r) {
         h_rec_vx[r * nt + current_it] = h_step_vx[r];
         h_rec_vz[r * nt + current_it] = h_step_vz[r];
@@ -839,4 +860,27 @@ void generateWavefieldTextureCUDA(GPUSimData& gpu, uchar4* d_rgba_out, float col
     dim3 block(16, 16);
     dim3 grid((gpu.NX + block.x - 1) / block.x, (gpu.NZ + block.y - 1) / block.y);
     generate_colormap_kernel << <grid, block >> > (gpu, d_rgba_out, color_scale, show_component);
+}
+
+// =============================================================================
+// 【新增】： recordReceiverStepGPU 的主机端包装实现 (MSVC 与 NVCC 之间的安全桥梁)
+// =============================================================================
+void recordReceiverStepGPU(GPUSimData& gpu, int num_rcv, float* h_out_vx, float* h_out_vz) {
+    if (num_rcv <= 0) return;
+
+    // 1. 在 GPU 端高并发提取当前时步下所有接收器的振幅
+    int threads = 128;
+    int blocks = (num_rcv + threads - 1) / threads;
+    extract_receivers_kernel << <blocks, threads >> > (
+        gpu.d_vx_1, gpu.d_vx_2, gpu.d_vz_1, gpu.d_vz_2,
+        gpu.d_vx, gpu.d_vz,
+        gpu.d_rcv_grid_idx,
+        gpu.d_record_vx_step,
+        gpu.d_record_vz_step,
+        num_rcv, gpu.flag_type
+        );
+
+    // 2. 将 GPU 提取出的单步振幅拷回由 C++ 传入的 Host 临时数组中 (瞬间完成，无任何总线拥堵)
+    cudaMemcpy(h_out_vx, gpu.d_record_vx_step, num_rcv * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_out_vz, gpu.d_record_vz_step, num_rcv * sizeof(float), cudaMemcpyDeviceToHost);
 }

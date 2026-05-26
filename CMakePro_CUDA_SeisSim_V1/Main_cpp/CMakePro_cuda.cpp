@@ -45,15 +45,17 @@
 // 5. 本项目自定义头文件 (Project Specific Headers)
 // =================================================================================
 #include "CMakePro_cuda.h" // 包含启动界面逻辑、系统结构体及核心计算单元
- // =================================================================================
- // 主函数
- // =================================================================================
 
+// =================================================================================
+// GLFW 错误捕获回调
+// =================================================================================
 static void glfw_error_callback(int error, const char* description) {
-    std::cerr << "Glfw Error " << error << ": " << description << std::endl;
+    std::cerr << "Glfw Error [" << error << "]: " << description << std::endl;
 }
 
-
+// =================================================================================
+// 初始化离屏渲染四边形几何体 VAO/VBO
+// =================================================================================
 void InitQuad(GLHandles& gl) {
     // 定义 4 个顶点：位置(x,y,z) + 纹理坐标(u,v)
     float vertices[] = {
@@ -86,10 +88,14 @@ void InitQuad(GLHandles& gl) {
     glBindVertexArray(0);
 }
 
+// =================================================================================
+// 主函数入口
+// =================================================================================
 int main() {
-
+    // -----------------------------------------------------------------------------
+    // Stage 1: CUDA 硬件环境诊断
+    // -----------------------------------------------------------------------------
     std::cout << "========= CUDA 硬件环境测试 =========" << std::endl;
-    // 1. 测试获取 GPU 信息
     GpuInfo info = GetCudaDeviceInfo();
     if (info.success) {
         std::cout << "[成功] 找到 GPU 设备:" << std::endl;
@@ -102,15 +108,17 @@ int main() {
         return -1;
     }
 
-    // 1. 系统与配置对象初始化
+    // 系统与配置对象初始化
     SimState state;         // 状态管理
     SimConfig config;       // 程序配置
     GLHandles gl;           // OpenGL 资源句柄
     AsyncLoader g_loader;   // 后台加载器
 
-    // ============================================================
-    // 1.1 GLFW 与 OpenGL 窗口环境搭建
-    // ============================================================
+    // -----------------------------------------------------------------------------
+    // Stage 2: GLFW 与 OpenGL 窗口环境搭建
+    // -----------------------------------------------------------------------------
+    glfwSetErrorCallback(glfw_error_callback); // 注册错误回调
+
     if (!glfwInit()) {
         std::cerr << "Failed to initialize GLFW" << std::endl;
         return -1;
@@ -148,8 +156,15 @@ int main() {
         return -1;
     }
 
-    InitQuad(gl);//
-    // 加载渲染着色器 (可视化)
+    // -----------------------------------------------------------------------------
+    // Stage 3: 离屏基础几何构建
+    // -----------------------------------------------------------------------------
+    InitQuad(gl);
+
+    // -----------------------------------------------------------------------------
+    // Stage 4: 着色器与纹理管线编译
+    // -----------------------------------------------------------------------------
+    // 1. 加载渲染着色器 (可视化热力图等)
     gl.renderProg = glCreateProgram();
     std::string vsSrc = loadShaderFromFile("../resource_CUDA_V1/shader/vs_code.vert");
     std::string fsSrc = loadShaderFromFile("../resource_CUDA_V1/shader/fs_code.frag");
@@ -159,27 +174,20 @@ int main() {
     glAttachShader(gl.renderProg, fs);
     glLinkProgram(gl.renderProg);
 
-    // 在 gl.renderProg 链接之后
+    // 链接成功后及时删除临时着色器对象，防止资源泄露
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    // 生成与注册 OpenGL 纹理（用于存储 0.0 ~ 1.0 的单通道热力值）
     glGenTextures(1, &gl.lifeTex);
     glBindTexture(GL_TEXTURE_2D, gl.lifeTex);
-    // 我们使用 GL_R32F 存储热力值（0.0 ~ 1.0）
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, 1920, 1080, 0, GL_RED, GL_FLOAT, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    // 注册纹理到 CUDA
-    cudaGraphicsGLRegisterImage(&gl.cudaRes, gl.lifeTex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
 
-    // 初始化 CUDA 内部缓冲区
-    InitCudaLife(1920, 1080); // 初始化随机数生成器
-    cudaMalloc(&gl.d_current, 1920 * 1080);
-    cudaMalloc(&gl.d_next, 1920 * 1080);
-    cudaMalloc(&gl.d_heatData, 1920 * 1080 * sizeof(float));
-    // 必须：给初始数据！
-    SeedCudaLife(gl.d_current, 1920, 1080, 0.3f);
-
-    // 1. 编译并加载地震专用着色器 
+    // 2. 编译并加载地震专用渲染着色器 
     gl.seisProg = glCreateProgram();
     std::string seisVsSrc = loadShaderFromFile("../resource_CUDA_V1/shader/seis_code.vert");
     std::string seisFsSrc = loadShaderFromFile("../resource_CUDA_V1/shader/seis_code.frag");
@@ -188,73 +196,95 @@ int main() {
     glAttachShader(gl.seisProg, seisVs);
     glAttachShader(gl.seisProg, seisFs);
     glLinkProgram(gl.seisProg);
-    glDeleteShader(seisFs); // 链接后可安全删除临时 shader 句柄
 
+    // 及时释放临时着色器资源
+    glDeleteShader(seisVs);
+    glDeleteShader(seisFs);
 
-    // 初始化 ImGui 与 ImPlot
+    // -----------------------------------------------------------------------------
+    // Stage 5: CUDA 互操作与内部缓冲区分配
+    // -----------------------------------------------------------------------------
+    // 将 OpenGL 纹理注册到 CUDA 互操作资源中
+    cudaGraphicsGLRegisterImage(&gl.cudaRes, gl.lifeTex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
+
+    // 初始化 CUDA 内部生命模拟算法相关的状态及缓冲区
+    InitCudaLife(1920, 1080); // 初始化随机数生成器
+    cudaMalloc(&gl.d_current, 1920 * 1080);
+    cudaMalloc(&gl.d_next, 1920 * 1080);
+    cudaMalloc(&gl.d_heatData, 1920 * 1080 * sizeof(float));
+
+    // 植入初始种子数据
+    SeedCudaLife(gl.d_current, 1920, 1080, 0.3f);
+
+    // -----------------------------------------------------------------------------
+    // Stage 6: UI 框架（ImGui / ImPlot）环境构建
+    // -----------------------------------------------------------------------------
     Init_Imgui(window);
     ImPlot::CreateContext();
 
-    // ============================================================
-    // 1.2 初始状态设定
-    // ============================================================
-    state.isIntroMode = true; // 强制从启动页开始
-    // 在循环开始前，先根据初始状态设置一次
+    // 初始运行状态设定 (强制开启启动屏逻辑)
+    state.isIntroMode = true;
     glfwSwapInterval(state.vsyncEnabled ? 1 : 0);
-    // ============================================================
-    // 2. 主循环 (Main Loop)
-    // ============================================================
+
+    // =============================================================================
+    // 主渲染循环
+    // =============================================================================
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
-        // 1. 首先清除整个屏幕（必须在所有渲染之前）
+
+        // 1. 清空主后备缓冲区底色
         glClearColor(0.1f, 0.12f, 0.15f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
-        // VSync 动态切换逻辑 ---
+
+        // 2. 动态垂直同步检测
         static bool lastVsync = state.vsyncEnabled;
         if (state.vsyncEnabled != lastVsync) {
             glfwSwapInterval(state.vsyncEnabled ? 1 : 0);
             lastVsync = state.vsyncEnabled;
         }
 
-        // 帧信息获取
+        // 3. 窗口大小采集与用户闲置状态追踪
         int winW, winH;
         glfwGetWindowSize(window, &winW, &winH);
-        CheckIdleStatus(window, state); // 检测用户是否空闲
+        CheckIdleStatus(window, state);
 
-        // 2. ImGui 准备新帧
+        // 4. GUI 准备新帧数据
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        // --- 键盘切换逻辑 ---
-        ProcessInput(window, config, state, gl);//处理输入 (Input Processing)
-        // 使用新的分发器渲染
+        // 5. 事件响应与输入控制处理
+        ProcessInput(window, config, state, gl);
 
+        // 6. 场景渲染分发 (包含启动页与核心模拟页面)
         RenderApp(state.currentScreen, state, info, winW, winH, gl, g_loader);
-        state.isIntroMode = IsIntroScreen(state.currentScreen); // 同步状态
+        state.isIntroMode = IsIntroScreen(state.currentScreen); // 同步页面标识
 
-        // --- 渲染提交 ---
+        // 7. GUI 指令集提交
         ImGui::Render();
-
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-        // 处理多视口 (如果 ImGui 开启了多窗口支持)
+        // 8. 多视口支持 (针对分离窗口渲染状态)
         if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
             GLFWwindow* backup_context = glfwGetCurrentContext();
             ImGui::UpdatePlatformWindows();
             ImGui::RenderPlatformWindowsDefault();
             glfwMakeContextCurrent(backup_context);
         }
+
         glfwSwapBuffers(window);
     }
 
-    // ============================================================
-    // 3. 资源清理 (Cleanup)
-    // ============================================================
-    cleanup(gl); // 确保实现此函数以释放纹理/Shader资源
+    // =============================================================================
+    // 资源销毁与环境释放
+    // =============================================================================
+    cleanup(gl); // 调用原有资源释放函数释放句柄与 CUDA 缓冲区
+
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
+
+    glfwDestroyWindow(window);
     glfwTerminate();
 
     return 0;
