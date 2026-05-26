@@ -54,12 +54,12 @@ inline int temp_pml = 50;
 // --- 时间演化与渲染属性 ---
 inline int current_it = 0;
 inline float accumulated_compute_time = 0.0f;
-inline float color_scale = 10.0f;
+inline float color_scale = 20.0f;
 inline int show_component = 0; // 0: Vz, 1: Vx
 inline int steps_per_frame = 20;
 inline bool showHUD = true;
 inline bool show_Monitor_par = false;
-inline int waveStyle = 0; // 默认采用 Style 0: Magma Glow
+inline int waveStyle = 7; // 默认采用 Style 7,Turbo
 
 // --- 物理震源位置与受力角度 ---
 inline int edit_src_x = 500;
@@ -2679,19 +2679,61 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
 
                 if (ImGui::BeginTabItem("visual")) {
                     ImGui::Spacing();
-                    ImGui::SliderFloat("Color Gain", &color_scale, 1e0f, 1e3f, "%.1f");
+                    ImGui::SliderFloat("Color Gain", &color_scale, 0.1f, 100.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
                     const char* components[] = { "Vz (Vertical)", "Vx (Horizontal)" };
                     ImGui::Combo("Show Component", &show_component, components, IM_ARRAYSIZE(components));
 
                     ImGui::Spacing();
-                    const char* style_types[] = { "Magma Glow ", "3D Specular Coolwarm", "Neon Bipolar" };
+                    
+                    const char* style_types[] = {
+
+                        // =====================================================
+                        // Diverging Scientific Wavefield Maps
+                        // =====================================================
+
+                        "0_Seismic Bipolar",      // 0 标准地震红白蓝
+                        "1_Coolwarm",             // 1 Matplotlib 经典冷暖
+                        "2_PuOr",                 // 2 紫橙双极振幅
+                        "3_Grayscale",            // 3 灰度振幅图
+
+                        // =====================================================
+                        // Sequential Energy Maps
+                        // =====================================================
+
+                        "4_Inferno",              // 4 深邃红黄能量场
+                        "5_Plasma",               // 5 感知均匀霓虹
+                        "6_Viridis",              // 6 Matplotlib 标准
+                        "7_Turbo",                // 7 Google Turbo 高动态
+                        "8_Magma Glow",           // 8 熔岩发光风格
+
+                        // =====================================================
+                        // Legacy / Experimental
+                        // =====================================================
+
+                        "9_Jet Rainbow",          // 9 经典彩虹(QCP/MATLAB)
+                        "10_Hot",                  // 10 热火色谱
+                        "11_Cold",                 // 11 冰冷色谱
+
+                        // =====================================================
+                        // Specialized
+                        // =====================================================
+
+                        "12_Terrain Map"           // 12 地貌地质图
+                    };
                     ImGui::Combo("Visual Style", &waveStyle, style_types, IM_ARRAYSIZE(style_types));
                     ImGui::Spacing();
 
                     // =================================================================
-                    // 【新增】：地质模型背景切换控件 [1.2.7]
+                    // 【全新对齐】：地质模型背景风格切换增加第四选项 [1.2.7]
                     // =================================================================
-                    const char* model_styles[] = { "Titanium Grey", "Geological Map", "Grayscale Vp", "Viridis Colormap", "Cyber Neon" };
+                    const char* model_styles[] =
+                    {
+                        "Dark Titanium",
+                        "Geological Map",
+                        "Grayscale Velocity",
+                        "WaveStyle Synced",
+                        "Scientific White"
+                    };
                     ImGui::Combo("Geological Background", &modelStyle, model_styles, IM_ARRAYSIZE(model_styles));
                     ImGui::Spacing();
                     // =================================================================
@@ -2708,7 +2750,6 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                 ImGui::EndTabBar();
             }
 
-            
             ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 55 * scale);
             float avail_w = ImGui::GetContentRegionAvail().x;
             float reset_btn_w = 60.0f * scale;

@@ -12,17 +12,344 @@ uniform vec2 simSize;
 uniform float viewZoom;
 uniform float totalTime;
 uniform float npml;              // PML 边界格数
-uniform int waveStyle;           // 0: 熔岩, 1: 3D 釉面, 2: 经典红蓝
-uniform int modelStyle;          // 背景风格: 0: 经典钛金, 1: 科学地质图, 2: 灰度Vp, 3: Viridis, 4: Cyber
+uniform int waveStyle;           // 0: Magma, 1~12 对应标准科学色谱
+uniform int modelStyle;          // 背景地质图风格: 0: 经典钛金, 1: 科学地质图, 2: 灰度Vp, 3: 跟随波场风格
 
-uniform bool showGrid;        // <-- 新增：控制网格与矩阵点显示的开关
+uniform bool showGrid;
+// =============================================================================
+// 【第一级：零依赖底层几何与差值辅助函数】
+// =============================================================================
 
-// 4 级色谱线性插值辅助函数
-vec3 ramp4(float t, vec3 c1, vec3 c2, vec3 c3, vec3 c4) {
-    if (t < 0.333) return mix(c1, c2, t * 3.0);
-    if (t < 0.666) return mix(c2, c3, (t - 0.333) * 3.0);
-    return mix(c3, c4, (t - 0.666) * 3.0);
+float getGridLine(
+    float pos,
+    float spacing,
+    float pixelWidth)
+{
+    float coord =
+        pos / spacing;
+
+    float df =
+        max(
+            fwidth(coord),
+            1e-5
+        );
+
+    float dist =
+        abs(coord - round(coord));
+
+    return 1.0 -
+        smoothstep(
+            pixelWidth,
+            pixelWidth + 1.0,
+            dist / df
+        );
 }
+
+// 无分支 2D 矩形 SDF 距离函数 (无外部依赖，优先置顶)
+float sdBox(vec2 p, vec2 b) {
+    vec2 d = abs(p) - b;
+    return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
+}
+
+// =============================================================================
+// 【第二级：12 套标准的科学色谱单向定义】
+// =============================================================================
+vec3 getJet(float t)
+{
+    vec3 c0 = vec3(0.0, 0.0, 0.5);
+    vec3 c1 = vec3(0.0, 0.5, 1.0);
+    vec3 c2 = vec3(0.5, 1.0, 0.5);
+    vec3 c3 = vec3(1.0, 0.75, 0.0);
+    vec3 c4 = vec3(0.5, 0.0, 0.0);
+
+    if (t < 0.25)
+        return mix(c0, c1, t * 4.0);
+
+    if (t < 0.5)
+        return mix(c1, c2, (t - 0.25) * 4.0);
+
+    if (t < 0.75)
+        return mix(c2, c3, (t - 0.5) * 4.0);
+
+    return mix(c3, c4, (t - 0.75) * 4.0);
+}
+
+vec3 getTerrain(float t) {
+    vec3 c0 = vec3(0.0, 0.235, 0.667);
+    vec3 c1 = vec3(0.0, 0.706, 0.863);
+    vec3 c2 = vec3(0.941, 0.941, 0.471);
+    vec3 c3 = vec3(0.196, 0.784, 0.196);
+    vec3 c4 = vec3(0.471, 0.392, 0.235);
+    vec3 c5 = vec3(0.98, 0.98, 0.98);
+    if (t < 0.25) return mix(c0, c1, t * 4.0);
+    if (t < 0.45) return mix(c1, c2, (t - 0.25) / 0.20);
+    if (t < 0.60) return mix(c2, c3, (t - 0.45) / 0.15);
+    if (t < 0.80) return mix(c3, c4, (t - 0.60) / 0.20);
+    return mix(c4, c5, (t - 0.80) / 0.20);
+}
+
+vec3 getSeismic(float t)
+{
+    vec3 c0 = vec3(0.000, 0.000, 0.706);
+
+    // 更稳定的 phase center
+    vec3 c1 = vec3(0.88, 0.88, 0.88);
+
+    vec3 c2 = vec3(0.706, 0.000, 0.000);
+
+    if (t < 0.5)
+        return mix(c0, c1, t * 2.0);
+
+    return mix(c1, c2, (t - 0.5) * 2.0);
+}
+
+vec3 getGrayscale(float t)
+{
+    vec3 c0 = vec3(0.12);
+    vec3 c1 = vec3(0.50);
+    vec3 c2 = vec3(0.88);
+
+    if (t < 0.5)
+        return mix(c0, c1, t * 2.0);
+
+    return mix(c1, c2, (t - 0.5) * 2.0);
+}
+
+vec3 getHot(float t) {
+    vec3 c0 = vec3(0.0, 0.0, 0.0);
+    vec3 c1 = vec3(1.0, 0.0, 0.0);
+    vec3 c2 = vec3(1.0, 1.0, 0.0);
+    vec3 c3 = vec3(1.0, 1.0, 1.0);
+    if (t < 0.333) return mix(c0, c1, t * 3.0);
+    if (t < 0.666) return mix(c1, c2, (t - 0.333) * 3.0);
+    return mix(c2, c3, (t - 0.666) * 3.0);
+}
+
+vec3 getCold(float t) {
+    vec3 c0 = vec3(0.0, 0.0, 0.0);
+    vec3 c1 = vec3(0.0, 0.0, 1.0);
+    vec3 c2 = vec3(0.0, 1.0, 1.0);
+    vec3 c3 = vec3(1.0, 1.0, 1.0);
+    if (t < 0.333) return mix(c0, c1, t * 3.0);
+    if (t < 0.666) return mix(c1, c2, (t - 0.333) * 3.0);
+    return mix(c2, c3, (t - 0.666) * 3.0);
+}
+
+vec3 getCoolwarm(float t)
+{
+    vec3 c0 = vec3(0.230, 0.299, 0.754);
+    vec3 c1 = vec3(0.554, 0.690, 0.996);
+    vec3 c2 = vec3(0.865, 0.865, 0.865);
+    vec3 c3 = vec3(0.957, 0.598, 0.477);
+    vec3 c4 = vec3(0.706, 0.016, 0.150);
+
+    if (t < 0.25)
+        return mix(c0, c1, t * 4.0);
+
+    if (t < 0.5)
+        return mix(c1, c2, (t - 0.25) * 4.0);
+
+    if (t < 0.75)
+        return mix(c2, c3, (t - 0.5) * 4.0);
+
+    return mix(c3, c4, (t - 0.75) * 4.0);
+}
+
+vec3 getViridis(float t)
+{
+    vec3 c0 = vec3(0.267, 0.004, 0.329);
+    vec3 c1 = vec3(0.282, 0.137, 0.455);
+    vec3 c2 = vec3(0.251, 0.404, 0.541);
+    vec3 c3 = vec3(0.208, 0.718, 0.475);
+    vec3 c4 = vec3(0.561, 0.843, 0.267);
+
+    // 压高亮
+    vec3 c5 = vec3(0.85, 0.88, 0.18);
+
+    if (t < 0.2) return mix(c0, c1, t * 5.0);
+    if (t < 0.4) return mix(c1, c2, (t - 0.2) * 5.0);
+    if (t < 0.6) return mix(c2, c3, (t - 0.4) * 5.0);
+    if (t < 0.8) return mix(c3, c4, (t - 0.6) * 5.0);
+
+    return mix(c4, c5, (t - 0.8) * 5.0);
+}
+
+vec3 getPlasma(float t) {
+    vec3 c0 = vec3(0.051, 0.031, 0.529);
+    vec3 c1 = vec3(0.416, 0.0, 0.659);
+    vec3 c2 = vec3(0.733, 0.216, 0.329);
+    vec3 c3 = vec3(0.976, 0.557, 0.035);
+    vec3 c4 = vec3(0.941, 0.976, 0.129);
+    if (t < 0.25) return mix(c0, c1, t * 4.0);
+    if (t < 0.50) return mix(c1, c2, (t - 0.25) * 4.0);
+    if (t < 0.75) return mix(c2, c3, (t - 0.50) * 4.0);
+    return mix(c3, c4, (t - 0.75) * 4.0);
+}
+
+vec3 getTurbo(float t)
+{
+    vec3 c0 = vec3(0.190, 0.071, 0.232); // deep purple
+    vec3 c1 = vec3(0.276, 0.421, 0.891); // blue
+    vec3 c2 = vec3(0.158, 0.735, 0.923); // cyan
+
+    // 降低亮度
+    vec3 c3 = vec3(0.120, 0.780, 0.520); // green
+
+    // 降低黄区过曝
+    vec3 c4 = vec3(0.580, 0.820, 0.180); // yellow-green
+
+    vec3 c5 = vec3(0.930, 0.720, 0.180); // orange
+    vec3 c6 = vec3(0.980, 0.420, 0.120); // red-orange
+    vec3 c7 = vec3(0.480, 0.015, 0.015); // deep red
+
+    if (t < 0.10)
+        return mix(c0, c1, t * 10.0);
+
+    if (t < 0.20)
+        return mix(c1, c2, (t - 0.10) * 10.0);
+
+    if (t < 0.35)
+        return mix(c2, c3, (t - 0.20) / 0.15);
+
+    if (t < 0.50)
+        return mix(c3, c4, (t - 0.35) / 0.15);
+
+    if (t < 0.70)
+        return mix(c4, c5, (t - 0.50) / 0.20);
+
+    if (t < 0.85)
+        return mix(c5, c6, (t - 0.70) / 0.15);
+
+    return mix(c6, c7, (t - 0.85) / 0.15);
+}
+
+vec3 getInferno(float t) {
+    vec3 c0 = vec3(0.0, 0.0, 0.016);
+    vec3 c1 = vec3(0.341, 0.063, 0.427);
+    vec3 c2 = vec3(0.733, 0.216, 0.329);
+    vec3 c3 = vec3(0.976, 0.557, 0.035);
+    vec3 c4 = vec3(0.988, 1.0, 0.643);
+    if (t < 0.25) return mix(c0, c1, t * 4.0);
+    if (t < 0.50) return mix(c1, c2, (t - 0.25) * 4.0);
+    if (t < 0.75) return mix(c2, c3, (t - 0.50) * 4.0);
+    return mix(c3, c4, (t - 0.75) * 4.0);
+}
+
+vec3 getPuOr(float t)
+{
+    vec3 c0 = vec3(0.498, 0.231, 0.031);
+    vec3 c1 = vec3(0.775, 0.518, 0.235);
+    vec3 c2 = vec3(0.992, 0.878, 0.714);
+
+    vec3 c3 = vec3(0.92, 0.92, 0.90);
+
+    vec3 c4 = vec3(0.847, 0.855, 0.922);
+    vec3 c5 = vec3(0.592, 0.554, 0.745);
+    vec3 c6 = vec3(0.329, 0.153, 0.533);
+
+    if (t < 0.166)
+        return mix(c0, c1, t * 6.0);
+
+    if (t < 0.333)
+        return mix(c1, c2, (t - 0.166) * 6.0);
+
+    if (t < 0.5)
+        return mix(c2, c3, (t - 0.333) * 6.0);
+
+    if (t < 0.666)
+        return mix(c3, c4, (t - 0.5) * 6.0);
+
+    if (t < 0.833)
+        return mix(c4, c5, (t - 0.666) * 6.0);
+
+    return mix(c5, c6, (t - 0.833) * 6.0);
+}
+
+// =============================================================================
+// 【 核心重構：高度复用的全局 13 套标准科学色谱映射函数库 】 [1.2.7]
+// =============================================================================
+vec3 getColormap(int style, float t, vec3 midCol)
+{
+    // =====================================================
+    // Diverging Scientific Wavefield Maps
+    // =====================================================
+
+    if (style == 0)
+        return getSeismic(t);
+
+    else if (style == 1)
+        return getCoolwarm(t);
+
+    else if (style == 2)
+        return getPuOr(t);
+
+    else if (style == 3)
+        return getGrayscale(t);
+
+    // =====================================================
+    // Sequential Energy Maps
+    // =====================================================
+
+    else if (style == 4)
+        return getInferno(t);
+
+    else if (style == 5)
+        return getPlasma(t);
+
+    else if (style == 6)
+        return getViridis(t);
+
+    else if (style == 7)
+        return getTurbo(t);
+
+    else if (style == 8)
+    {
+        // Magma Glow (经典熔岩发光)
+
+        vec3 c0 = midCol;
+        vec3 c1 = vec3(0.25, 0.05, 0.35);
+        vec3 c2 = vec3(0.70, 0.15, 0.40);
+        vec3 c3 = vec3(0.95, 0.50, 0.15);
+        vec3 c4 = vec3(1.0, 1.0, 1.0);
+
+        if (t < 0.25)
+            return mix(c0, c1, t * 4.0);
+
+        else if (t < 0.5)
+            return mix(c1, c2, (t - 0.25) * 4.0);
+
+        else if (t < 0.75)
+            return mix(c2, c3, (t - 0.5) * 4.0);
+
+        return mix(c3, c4, (t - 0.75) * 4.0);
+    }
+
+    // =====================================================
+    // Legacy / Experimental
+    // =====================================================
+
+    else if (style == 9)
+        return getJet(t);
+
+    else if (style == 10)
+        return getHot(t);
+
+    else if (style == 11)
+        return getCold(t);
+
+    // =====================================================
+    // Specialized
+    // =====================================================
+
+    else if (style == 12)
+        return getTerrain(t);
+
+    return midCol;
+}
+
+// =============================================================================
+// 【第三级：物性取值与地层解析函数】
+// =============================================================================
 
 // 物理 Vp 速度值提取
 float calcVp(vec2 uv) {
@@ -40,97 +367,288 @@ float calcRHO(vec2 uv) {
     return uniformRho;
 }
 
-// 抗锯齿网格自适应线宽函数
-float getGridLine(float pos, float spacing, float pixelWidth) {
-    float coord = pos / spacing;
-    float df = max(fwidth(coord), 0.0001);
-    float grid = abs(fract(coord - 0.5) - 0.5) / df;
-    float line = 1.0 - min(grid / pixelWidth, 1.0);
-    return line;
-}
-
-// 无分支 2D 矩形 SDF 距离函数
-float sdBox(vec2 p, vec2 b) {
-    vec2 d = abs(p) - b;
-    return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
-}
-
 // =============================================================================
-// 【 核心重构：高度契合多地质图风格的自适应背景生成函数 】
+// 【 核心重构：高度集成的地质背景生成函数 】
 // =============================================================================
-vec3 getGeologicalBackground(vec2 uv, vec2 cellPos) {
-    // 默认 Style 0: 经典钛金灰深色底
-    vec3 bgCol = vec3(0.012, 0.015, 0.018); 
-    
-    float vp = calcVp(uv);
-    float t = clamp((vp - 500.0) / 5500.0, 0.0, 1.0);
-    
-    // --- Geological Styles 切换 (保留经典核心样式) ---
-    if (modelStyle == 0) {
-        // Style 0: 经典钛金灰
-        bgCol = vec3(0.012, 0.015, 0.018);
+vec3 getGeologicalBackground(vec2 uv, vec2 cellPos)
+{
+    // =========================================================
+    // Velocity -> normalized scalar
+    // =========================================================
+
+    float vp =
+        calcVp(uv);
+
+    float t =
+        clamp(
+            (vp - 500.0) / 5500.0,
+            0.0,
+            1.0
+        );
+
+    // =========================================================
+    // Default Background
+    // =========================================================
+
+    vec3 bgCol =
+        vec3(0.012, 0.015, 0.018);
+
+    // =========================================================
+    // Style 0
+    // Dark Titanium
+    // =========================================================
+
+    if (modelStyle == 0)
+    {
+        bgCol =
+            vec3(0.012, 0.015, 0.018);
     }
-    else if (modelStyle == 1) {
-        // Style 1: 科学地质图 (Modern Geological Map)
-        vec3 cWater = vec3(0.0, 0.22, 0.45);  // 深蓝水层/极软层
-        vec3 cSed   = vec3(0.28, 0.55, 0.42); // 青灰沉积层
-        vec3 cRock  = vec3(0.75, 0.65, 0.28); // 沙黄硬砂岩
-        vec3 cHard  = vec3(0.68, 0.18, 0.12); // 红褐基岩/超硬层
 
-        if (t < 0.333)       bgCol = mix(cWater, cSed, t * 3.0);
-        else if (t < 0.666)  bgCol = mix(cSed, cRock, (t - 0.333) * 3.0);
-        else                 bgCol = mix(cRock, cHard, (t - 0.666) * 3.0);
+    // =========================================================
+    // Style 1
+    // Geological Map
+    // =========================================================
 
-        // 邻域差分边缘检测 (非均匀介质下自动在层位边界绘制黑色科学剖分线)
-        if (useModelTexture) {
-            vec2 texelSize = 1.0 / simSize;
-            float vp_right = calcVp(uv + vec2(texelSize.x, 0.0));
-            float vp_up    = calcVp(uv + vec2(0.0, texelSize.y));
-            float diff = abs(vp - vp_right) + abs(vp - vp_up);
-            float edge = smoothstep(10.0, 50.0, diff);
-            bgCol = mix(bgCol, vec3(0.05, 0.05, 0.08), edge * 0.4);
+    else if (modelStyle == 1)
+    {
+        vec3 cWater = vec3(0.0,  0.22, 0.45);
+        vec3 cSed   = vec3(0.28, 0.55, 0.42);
+        vec3 cRock  = vec3(0.75, 0.65, 0.28);
+        vec3 cHard  = vec3(0.68, 0.18, 0.12);
+
+        if (t < 0.333)
+        {
+            bgCol =
+                mix(cWater, cSed, t * 3.0);
+        }
+        else if (t < 0.666)
+        {
+            bgCol =
+                mix(
+                    cSed,
+                    cRock,
+                    (t - 0.333) * 3.0
+                );
+        }
+        else
+        {
+            bgCol =
+                mix(
+                    cRock,
+                    cHard,
+                    (t - 0.666) * 3.0
+                );
+        }
+
+        // -----------------------------------------------------
+        // Structural edge enhancement
+        // -----------------------------------------------------
+
+        if (useModelTexture)
+        {
+            vec2 texelSize =
+                1.0 / simSize;
+
+            float vp_right =
+                calcVp(
+                    uv + vec2(texelSize.x, 0.0)
+                );
+
+            float vp_up =
+                calcVp(
+                    uv + vec2(0.0, texelSize.y)
+                );
+
+            float diff =
+                abs(vp - vp_right)
+              + abs(vp - vp_up);
+
+            float edge =
+                smoothstep(
+                    10.0,
+                    50.0,
+                    diff
+                );
+
+            bgCol =
+                mix(
+                    bgCol,
+                    vec3(0.05, 0.05, 0.08),
+                    edge * 0.35
+                );
         }
     }
-    else if (modelStyle == 2) {
-        // Style 2: 经典灰度 Vp 强度图
-        bgCol = vec3(t * 0.6 + 0.08);
-    }
-    else if (modelStyle == 3) {
-        // Style 3: 经典高对比度 Viridis 色谱 (绿-黄-蓝)
-        vec3 c1 = vec3(0.26, 0.00, 0.33); vec3 c2 = vec3(0.19, 0.40, 0.56);
-        vec3 c3 = vec3(0.12, 0.63, 0.53); vec3 c4 = vec3(0.99, 0.90, 0.14);
-        bgCol = ramp4(t, c1, c2, c3, c4);
-    }
-    else if (modelStyle == 4) {
-        // Style 4: 赛博高能高对比度色谱
-        vec3 c1 = vec3(0.02, 0.08, 0.15); vec3 c2 = vec3(0.00, 0.45, 0.55);
-        vec3 c3 = vec3(0.30, 0.00, 0.60); vec3 c4 = vec3(0.90, 0.10, 0.50);
-        bgCol = ramp4(t, c1, c2, c3, c4);
+
+    // =========================================================
+    // Style 2
+    // Grayscale Velocity
+    // =========================================================
+
+    else if (modelStyle == 2)
+    {
+        float g =
+            mix(0.18, 0.82, t);
+
+        bgCol =
+            vec3(g);
     }
 
-    // =============================================================================
-    // 【 核心优化 】PML 阻尼层斜条纹自适应光影融合 (Damping Stripes)
-    // 采用“动态相乘变暗”代替“强行混合钛灰色”，让地质图边界自然变暗，杜绝钛灰色色块！
-    // =============================================================================
-    if (npml > 0.0) {
-        float distToEdge = min(min(cellPos.x, simSize.x - cellPos.x), 
-                               min(cellPos.y, simSize.y - cellPos.y));
+    // =========================================================
+    // Style 3
+    // Sync With Active Wave Colormap
+    // =========================================================
 
-        if (distToEdge < npml) {
-            // 斜向阻尼线光栅计算
-            float stripe = step(0.5, fract((cellPos.x + cellPos.y) * 0.15));
-            float fadeFactor = (0.25 + 0.15 * stripe) * smoothstep(0.0, npml, npml - distToEdge);
-            
-            // 关键：不混合 vec3(0.06)，而是直接将当前的 bgCol 与 bgCol * 0.15 混合，实现高雅的物理变暗
-            bgCol = mix(bgCol, bgCol * 0.15, fadeFactor); 
+    else if (modelStyle == 3)
+    {
+        bgCol =
+            getColormap(
+                waveStyle,
+                t,
+                vec3(0.015, 0.018, 0.022)
+            );
+
+        // -----------------------------------------------------
+        // Background desaturation
+        // 避免背景和波场竞争
+        // -----------------------------------------------------
+
+        bgCol =
+            mix(
+                vec3(dot(bgCol, vec3(0.299, 0.587, 0.114))),
+                bgCol,
+                0.55
+            );
+
+        // -----------------------------------------------------
+        // Dark scientific attenuation
+        // -----------------------------------------------------
+
+        bgCol *= 0.38;
+    }
+
+    // =========================================================
+    // Style 4
+    // Pure White Scientific Background
+    // =========================================================
+
+    else if (modelStyle == 4)
+    {
+        // -----------------------------------------------------
+        // Soft scientific white
+        // 避免纯 1.0 白导致刺眼
+        // -----------------------------------------------------
+
+        vec3 c0 =
+            vec3(0.965);
+
+        vec3 c1 =
+            vec3(0.90);
+
+        bgCol =
+            mix(
+                c0,
+                c1,
+                t * 0.35
+            );
+
+        // -----------------------------------------------------
+        // Very soft structural variation
+        // -----------------------------------------------------
+
+        if (useModelTexture)
+        {
+            vec2 texelSize =
+                1.0 / simSize;
+
+            float vp_right =
+                calcVp(
+                    uv + vec2(texelSize.x, 0.0)
+                );
+
+            float vp_up =
+                calcVp(
+                    uv + vec2(0.0, texelSize.y)
+                );
+
+            float diff =
+                abs(vp - vp_right)
+              + abs(vp - vp_up);
+
+            float edge =
+                smoothstep(
+                    10.0,
+                    50.0,
+                    diff
+                );
+
+            bgCol =
+                mix(
+                    bgCol,
+                    vec3(0.82, 0.84, 0.88),
+                    edge * 0.12
+                );
+        }
+    }
+
+    // =========================================================
+    // PML Darkening
+    // =========================================================
+
+    if (npml > 0.0)
+    {
+        float distToEdge =
+            min(
+                min(cellPos.x, simSize.x - cellPos.x),
+                min(cellPos.y, simSize.y - cellPos.y)
+            );
+
+        if (distToEdge < npml)
+        {
+            float stripe =
+                step(
+                    0.5,
+                    fract(
+                        (cellPos.x + cellPos.y) * 0.15
+                    )
+                );
+
+            float fade =
+                smoothstep(
+                    0.0,
+                    npml,
+                    npml - distToEdge
+                );
+
+            // 白背景需要单独处理
+            if (modelStyle == 4)
+            {
+                bgCol =
+                    mix(
+                        bgCol,
+                        vec3(0.82, 0.84, 0.88),
+                        fade * (0.35 + 0.10 * stripe)
+                    );
+            }
+            else
+            {
+                bgCol =
+                    mix(
+                        bgCol,
+                        bgCol * 0.15,
+                        fade * (0.25 + 0.15 * stripe)
+                    );
+            }
         }
     }
 
     return bgCol;
 }
 
+// =============================================================================
+// 【第四级：主渲染 main() 函数，完全复用并精简，实现极致性能】
+// =============================================================================
 void main() {
-    // 1. 垂直翻转纹理坐标 Y (地表顶端对齐)
+    // 1. 垂直翻转纹理坐标 Y (地表居顶对齐)
     vec2 flippedTexCoords = vec2(TexCoords.x, 1.0 - TexCoords.y);
 
     // 2. 采样地震波场颜色
@@ -139,12 +657,10 @@ void main() {
     // 3. 将纹理坐标映射到实际网格单位
     vec2 cellPos = flippedTexCoords * simSize;
 
-    // 4. 计算高度定制化的地质/阻尼层融合背景 (100% 物理真实)
+    // 4. 计算自适应地质背景底色
     vec3 baseBG = getGeologicalBackground(flippedTexCoords, cellPos);
 
-    // =============================================================================
-    // 【 5. 逆向物理重构：解构振幅并计算 3D 凹凸起伏 】
-    // =============================================================================
+    // 5. 逆向物理重构：解构振幅值 v
     float v = 0.0;
     if (texColor.r > texColor.b) {
         v = 1.0 - texColor.g;      // 正振幅
@@ -152,165 +668,376 @@ void main() {
         v = -(1.0 - texColor.g);   // 负振幅
     }
 
-    // 偏导数重构 3D 凹凸表面法线
+    // 偏导数重构 3D 凹凸表面法线 (仅用于保留着色，彻底舍弃高能耗 specular 光照)
     float dx = dFdx(v) * 12.0; 
     float dy = dFdy(v) * 12.0;
     vec3 normal = normalize(vec3(-dx, -dy, 1.0));
     float gradLen = length(vec2(dx, dy));
 
     // =============================================================================
-    // 【 6. 多重渲染风格计算 (Styles) 】
+    // 6. 多重渲染风格计算 (重构：统一的双极性对称映射)
     // =============================================================================
-    vec3 waveColor = baseBG;
-    float waveIntensity = 0.0;
+    vec3 waveColor;
+float waveIntensity;
 
-    // --- Style 0: Magma (发光熔岩能量场) ---
-    if (waveStyle == 0) {
-        float energy = 1.0 - exp(-abs(v) * 8.0);
-        
-        vec3 c0 = baseBG;                 // 熔岩消隐后，无缝化为地质图底图
-        vec3 c1 = vec3(0.25, 0.05, 0.35); // 深紫色
-        vec3 c2 = vec3(0.70, 0.15, 0.40); // 紫红色
-        vec3 c3 = vec3(0.95, 0.50, 0.15); // 亮橙色
-        vec3 c4 = vec3(1.0, 1.0, 1.0);    // 纯白核心
-        
-        vec3 col;
-        if (energy < 0.25) {
-            col = mix(c0, c1, energy * 4.0);
-        } else if (energy < 0.5) {
-            col = mix(c1, c2, (energy - 0.25) * 4.0);
-        } else if (energy < 0.75) {
-            col = mix(c2, c3, (energy - 0.5) * 4.0);
-        } else {
-            col = mix(c3, c4, (energy - 0.75) * 4.0);
-        }
-        
-        waveColor = col;
-        waveIntensity = smoothstep(0.03, 0.35, energy);
-    }
-    // --- Style 1: Deep Coolwarm (3D 釉面起伏冷暖色) ---
-    else if (waveStyle == 1) {
-        float scaled_v = clamp(v * 2.5, -1.0, 1.0);
-    
-        vec3 col_warm = vec3(0.85, 0.05, 0.1);   // 浓郁宝石红
-        vec3 col_cool = vec3(0.05, 0.25, 0.85);  // 深邃皇家蓝
-        
-        // 【核心修复】：中性过渡色直接绑定 baseBG，消隐时完美沉入地层，拒绝脏灰色色块！
-        vec3 col_mid  = baseBG;                  
+bool isDiverging =
+       waveStyle == 0   // Seismic
+    || waveStyle == 1   // Coolwarm
+    || waveStyle == 2   // PuOr
+    || waveStyle == 3   // Grayscale
+    || waveStyle == 7;  // Turbo
+if (isDiverging)
+{
+    // =====================================================
+    // Signed Wavefield Rendering
+    // =====================================================
 
-        vec3 base;
-        float intensity = pow(abs(scaled_v), 0.45); 
-        if (scaled_v > 0.0) {
-            base = mix(col_mid, col_warm, intensity);
-        } else {
-            base = mix(col_mid, col_cool, intensity);
-        }
+    float signedV =
+        tanh(v * 2.5);
 
-        // 乘法漫反射阴影，营造 3D 立体波峰起伏
-        vec3 lightDir = normalize(vec3(-0.4, 0.5, 0.8));
-        float shading = dot(normal, lightDir) * 0.25 + 0.95; 
-        vec3 finalCol = base * shading;
+    float t =
+        clamp(
+            signedV * 0.5 + 0.5,
+            0.0,
+            1.0
+        );
 
-        // 釉面高光反射
-        float spec = pow(max(dot(normal, vec3(0,0,1)), 0.0), 64.0);
-        finalCol += vec3(1.0) * spec * 0.25 * abs(scaled_v);
+    waveColor =
+        getColormap(
+            waveStyle,
+            t,
+            baseBG
+        );
 
-        // Alpha 阻尼消隐控制
-        float alpha = smoothstep(0.01, 0.1, abs(scaled_v) + gradLen * 0.05);
-    
-        waveColor = finalCol;
-        waveIntensity = clamp(alpha, 0.0, 1.0);
-    }
-    // --- Style 2: Default (经典荧光红蓝) ---
-    else {
-        waveColor = texColor.rgb;
-        waveIntensity = clamp(1.0 - texColor.g, 0.0, 1.0);
-        if (waveIntensity > 0.02) {
-            waveColor *= 1.3; 
-        }
-    }
+    // Diverging:
+    // 保留低振幅相位连续性
 
-    // 最终混合：无波场区域完全渲染为高保真的地层地质图，有波场区域叠加霓虹波纹
+    waveIntensity =
+        pow(
+            smoothstep(
+                0.001,
+                0.035,
+                abs(v)
+            ),
+            0.75
+        );
+}
+else
+{
+    // =====================================================
+    // Energy Rendering
+    // =====================================================
+
+    float energy =
+        tanh(abs(v) * 2.5);
+
+    waveColor =
+        getColormap(
+            waveStyle,
+            energy,
+            baseBG
+        );
+
+    // Sequential:
+    // 更强调主能量
+
+    waveIntensity =
+        pow(
+            smoothstep(
+                0.01,
+                0.12,
+                abs(v)
+            ),
+            0.95
+        );
+}
+
+// =====================================================
+// Diverging Signed Wavefield
+// =====================================================
+
+if (
+       waveStyle == 0   // Seismic
+    || waveStyle == 1   // Coolwarm
+    || waveStyle == 2   // PuOr
+    || waveStyle == 3   // Grayscale
+    || waveStyle == 7  // Turbo
+)
+{
+    float signedV =
+        tanh(v * 2.5);
+
+    float t =
+        clamp(
+            signedV * 0.5 + 0.5,
+            0.0,
+            1.0
+        );
+
+    waveColor =
+        getColormap(
+            waveStyle,
+            t,
+            baseBG
+        );
+
+    waveIntensity =
+        smoothstep(0.01, 0.1, abs(v));
+}
+
+// =====================================================
+// Sequential Energy Colormaps
+// =====================================================
+
+else
+{
+    float energy =
+        tanh(abs(v) * 2.5);
+
+    waveColor =
+        getColormap(
+            waveStyle,
+            energy,
+            baseBG
+        );
+
+    waveIntensity =
+        smoothstep(0.01, 0.1, abs(v));
+}
+
+    // 最终混合：无波场区域完全保留高保真地层地质图，有波场区域叠加标准波谱
     vec3 finalColor = mix(baseBG, waveColor, waveIntensity);
 
-    // =============================================================================
     // 7. 【物理双重网格绘制】
     // =============================================================================
-    float pxToGridUnits = fwidth(cellPos.x); 
+// Grid Helper
 
-    // A. 次网格 (白色)
-    float subLineX = getGridLine(cellPos.x, 1.0, 1.0);
-    float subLineY = getGridLine(cellPos.y, 1.0, 1.0);
-    float gridSub = max(subLineX, subLineY);
-    float opacitySub = 0.0196 * smoothstep(1.5, 0.4, pxToGridUnits); 
+// =============================================================================
+// Adaptive Scientific Grid Rendering
+// =============================================================================
 
-    // B. 主网格 (白色)
-    float mainInterval = 5.0;
-    float mainLineX = getGridLine(cellPos.x, mainInterval, 1.5);
-    float mainLineY = getGridLine(cellPos.y, mainInterval, 1.5);
-    float gridMain = max(mainLineX, mainLineY);
-    float opacityMain = 0.0588 * smoothstep(15.0, 4.0, pxToGridUnits); 
+// 更稳定的屏幕像素尺度
+float pxToGridUnits =
+    max(
+        fwidth(cellPos.x),
+        fwidth(cellPos.y)
+    );
 
-    // C. 主网格十字交点圆点 (青色)
-    vec2 mainCoord = cellPos / mainInterval;
-    vec2 nearestIntersection = round(mainCoord);
-    vec2 offsetToIntersection = (mainCoord - nearestIntersection) * mainInterval;
-    float distToIntersection = length(offsetToIntersection);
-    float distInPixels = distToIntersection / max(pxToGridUnits, 0.0001);
-    
-    float dotRadius = 3.0;
-    float dotAA = 1.0;
-    float gridDot = smoothstep(dotRadius + dotAA, dotRadius - dotAA, distInPixels);
-    float opacityDot = 0.137 * smoothstep(15.0, 4.0, pxToGridUnits); 
+if (showGrid)
+{
+    // =========================================================================
+    // Dynamic LOD
+    // =========================================================================
 
-    // 核心修改：仅在 showGrid 为 true 时，才向画面混合网格与圆点，否则保持纯净地质背景
-    if (showGrid) {
-        finalColor = mix(finalColor, vec3(1.0, 1.0, 1.0), gridSub * opacitySub);   
-        finalColor = mix(finalColor, vec3(1.0, 1.0, 1.0), gridMain * opacityMain); 
-        finalColor = mix(finalColor, vec3(0.0, 1.0, 1.0), gridDot * opacityDot);   
-    }   
+    float lod =
+        pow(
+            2.0,
+            floor(
+                log2(
+                    max(pxToGridUnits, 1e-5)
+                )
+            )
+        );
 
+    // 主网格间隔动态变化
+    float mainInterval =
+        max(
+            5.0,
+            lod * 5.0
+        );
 
-    // =============================================================================
-    // 8. 绘制 PML 吸收边界荧光线 (完全对齐 Section 9 极简 1D 坐标检测算法，彻底消除缩放闪烁)
-    // =============================================================================
+    // =========================================================================
+    // Colors
+    // =========================================================================
+
+    vec3 subGridCol =
+        vec3(0.72);
+
+    vec3 mainGridCol =
+        vec3(1.0);
+
+    vec3 dotCol =
+        vec3(0.5, 0.95, 0.5);
+
+    // =========================================================================
+    // Sub Grid
+    // =========================================================================
+
+    float subLineX =
+        getGridLine(
+            cellPos.x,
+            1.0,
+            0.7
+        );
+
+    float subLineY =
+        getGridLine(
+            cellPos.y,
+            1.0,
+            0.7
+        );
+
+    float gridSub =
+        max(
+            subLineX,
+            subLineY
+        );
+
+    float opacitySub =
+        0.018 *
+        (
+            1.0 -
+            smoothstep(
+                0.4,
+                1.5,
+                pxToGridUnits
+            )
+        );
+
+    // =========================================================================
+    // Main Grid
+    // =========================================================================
+
+    float mainLineX =
+        getGridLine(
+            cellPos.x,
+            mainInterval,
+            1.0
+        );
+
+    float mainLineY =
+        getGridLine(
+            cellPos.y,
+            mainInterval,
+            1.0
+        );
+
+    float gridMain =
+        max(
+            mainLineX,
+            mainLineY
+        );
+
+    float opacityMain =
+        0.055 *
+        (
+            1.0 -
+            smoothstep(
+                4.0,
+                15.0,
+                pxToGridUnits
+            )
+        );
+
+    // =========================================================================
+    // Grid Dots
+    // =========================================================================
+
+    vec2 mainCoord =
+        cellPos / mainInterval;
+
+    vec2 nearestIntersection =
+        round(mainCoord);
+
+    vec2 offsetToIntersection =
+        (mainCoord - nearestIntersection)
+        * mainInterval;
+
+    // 避免 sqrt
+    float dist2 =
+        dot(
+            offsetToIntersection,
+            offsetToIntersection
+        );
+
+    float dist2Pixels =
+        dist2 /
+        max(
+            pxToGridUnits * pxToGridUnits,
+            1e-6
+        );
+
+    float dotRadius =
+        2.5;
+
+    float dotAA =
+        2.0;
+
+    float gridDot =
+        1.0 -
+        smoothstep(
+            dotRadius * dotRadius,
+            (dotRadius + dotAA) *
+            (dotRadius + dotAA),
+            dist2Pixels
+        );
+
+    float opacityDot =
+        0.16 *
+        (
+            1.0 -
+            smoothstep(
+                4.0,
+                15.0,
+                pxToGridUnits
+            )
+        );
+
+    // =========================================================================
+    // Additive Blend
+    // =========================================================================
+
+    finalColor +=
+        subGridCol *
+        gridSub *
+        opacitySub;
+
+    finalColor +=
+        mainGridCol *
+        gridMain *
+        opacityMain;
+
+    finalColor +=
+        dotCol *
+        gridDot *
+        opacityDot;
+
+    finalColor =
+        clamp(
+            finalColor,
+            0.0,
+            1.0
+        );
+}
+
+    // 8. 绘制 PML 吸收边界荧光线 (采用最外层 1D 线性距离算法，彻底解决缩放闪烁)
     if (npml > 0.0) {
-        // A. 建立四个方向纯一维正交物理坐标的绝对距离 [3]
         float dPmlLeft   = abs(cellPos.x - npml);
         float dPmlRight  = abs(cellPos.x - (simSize.x - npml));
         float dPmlBottom = abs(cellPos.y - (simSize.y - npml));
         float dPmlTop    = abs(cellPos.y - npml);
 
         float distToPml = 1e6;
-    
-        // B. 在水平有效范围内（左边界到右边界之间），判定上下边界线的距离
-        // 增加 0.1 容差，确保水平线与垂直线在角落完美闭合、无微小黑点缺口
         if (cellPos.x >= (npml - 0.1) && cellPos.x <= simSize.x - (npml - 0.1)) {
             distToPml = min(distToPml, dPmlBottom);
             distToPml = min(distToPml, dPmlTop);
         }
-    
-        // C. 在垂直有效范围内（上边界到下边界之间），判定左右边界线的距离
         if (cellPos.y >= (npml - 0.1) && cellPos.y <= simSize.y - (npml - 0.1)) {
             distToPml = min(distToPml, dPmlLeft);
             distToPml = min(distToPml, dPmlRight);
         }
 
-        // D. 像素级抗锯齿宽度计算 (由于采用一维线性导数，宽幅在缩放时稳定常驻)
         float pmlLineThickness = 1.5; 
         float pmlAA = fwidth(distToPml);
         float pmlBorder = smoothstep(pmlAA * pmlLineThickness, 0.0, distToPml - 0.05);
-    
-        // 保持您代码中的荧光色调 [1.2.7]
+        
         vec3 pmlLineColor = vec3(0.5, 1.0, 0.5); 
         float topFade = smoothstep(0.0, npml + 2.0, cellPos.y);
-    
+        
         finalColor = mix(finalColor, pmlLineColor, pmlBorder * 0.65 * topFade);
     }
 
-    // =============================================================================
     // 9. 绘制最外层物理边界框 (白框)
-    // =============================================================================
     float dOuterLeft   = abs(cellPos.x - 1.0);
     float dOuterRight  = abs(cellPos.x - (simSize.x - 1.0));
     float dOuterBottom = abs(cellPos.y - 1.0);
@@ -330,6 +1057,5 @@ void main() {
     float outerBorder = smoothstep(outerAA * 1.5, 0.0, distToOuter - 0.05);
     finalColor = mix(finalColor, vec3(1.0, 1.0, 1.0), outerBorder * 0.4); 
 
-    // 12. 输出结果
     FragColor = vec4(finalColor, 0.8); 
 }
