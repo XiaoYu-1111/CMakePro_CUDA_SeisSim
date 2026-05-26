@@ -267,6 +267,8 @@ struct SimulationContext {
     int                src_z_idx;
     std::vector<float> wavelet;
     float              src_angle;
+    int                src_type;     // <-- 【新增】：震源激发类型
+    float              src_amp;      // <-- 【新增】：震源激发幅值倍数
 
     int              num_rcv;
     std::vector<int> rcv_grid_idx;

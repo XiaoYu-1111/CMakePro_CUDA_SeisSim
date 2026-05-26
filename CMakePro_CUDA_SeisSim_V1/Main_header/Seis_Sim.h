@@ -54,16 +54,20 @@ inline int   temp_pml = 50;
 inline int   current_it = 0;
 inline float accumulated_compute_time = 0.0f;
 inline float color_scale = 20.0f;
-inline int   show_component = 0;     // 0: Vz, 1: Vx
+inline int   show_component = 2;     // 0: Vz, 1: Vx
+inline int   waveStyle = 0;     // 默认采用 Style 7 (Turbo)
+inline int   modelStyle = 3; // 0: 钛金灰, 1: 科学地质图, 2: 灰度Vp, 3: 跟随波场, 4: 科学白背景
 inline int   steps_per_frame = 20;
 inline bool  showHUD = true;
 inline bool  show_Monitor_par = false;
-inline int   waveStyle = 7;     // 默认采用 Style 7 (Turbo)
+
 
 // --- 物理震源位置与受力角度 ---
 inline int   edit_src_x = 500;
 inline int   edit_src_z = 125;
 inline float edit_angle = 0.0f;
+inline float edit_amp = 1.0f; // 全局共享：激发幅值倍数 (0.1 ~ 10.0x)
+inline int   edit_source_type = 0;    // 全局共享：激发震源类型 (0:垂直力, 1:水平力, 2:膨胀源, 3:剪切源, 4:倾斜力)
 
 // --- 视口平移与滚轮缩放 ---
 inline float      viewZoom = 1.0f;
@@ -89,7 +93,7 @@ inline ImVec4 uiAccent = ImVec4(0.5f, 1.0f, 0.5f, 1.0f);
 
 inline bool is_mouse_inside = false;
 
-inline int modelStyle = 0; // 0: 钛金灰, 1: 科学地质图, 2: 灰度Vp, 3: 跟随波场, 4: 科学白背景
+
 inline int current_scene = SCENE_UNIFORM; // 当前加载的物理场景
 
 // --- 共享物性参数 ---
@@ -504,6 +508,8 @@ void setupTestContext(SimulationContext& ctx, const Parameters& par) {
     ctx.src_z_idx = ctx.NZ / 4;                                      // Z 轴深度设定在 1/4 处
     ctx.src_idx = ctx.src_z_idx * ctx.NX + (ctx.NX / 2);             // X 轴定位在中心 1/2 处
     ctx.src_angle = par.FDM.angle;
+    ctx.src_type = edit_source_type; // 绑定类型
+    ctx.src_amp = edit_amp;         // 绑定幅值
     generateRickerWavelet(ctx.wavelet, ctx.nt, ctx.dt, par.FDM.f0, par.FDM.t0);
 
     // 检波器 (中间水平放一行检波器)
@@ -1922,6 +1928,22 @@ inline void HandleSeismicInteractions(SimState& state, int winW, int winH, float
         active_sources.clear();
     }
 
+    if (!io.WantCaptureKeyboard && ImGui::IsKeyPressed(ImGuiKey_Q, false)) {
+        // 总共有 7 套物理分量 (Index 0 ~ 6)
+        show_component = (show_component + 1) % 7;
+    }
+    // =============================================================================
+    // F. 【新增】：响应键盘 W 键一键循环切换 13 套科学色谱波形样式
+    // =============================================================================
+    if (!io.WantCaptureKeyboard && ImGui::IsKeyPressed(ImGuiKey_W, false)) {
+        // 总共有 13 套波场样式 (Index 0 ~ 12)
+        waveStyle = (waveStyle + 1) % 13;
+    }
+    if (!io.WantCaptureKeyboard && ImGui::IsKeyPressed(ImGuiKey_E, false)) {
+        // 总共有 5 套背景风格 (Index 0 ~ 4)
+        modelStyle = (modelStyle + 1) % 5;
+    }
+
     // 计算屏幕缩放比例系数
     float  winAspect = (float)winW / (float)winH;
     float  simAspect = (float)ctx.NX / (float)ctx.NZ;
@@ -2525,15 +2547,40 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                 // ==========================================
                 if (ImGui::BeginTabItem("Source")) {
                     ImGui::Spacing();
-                    ImGui::TextColored(uiAccent, "Source Position & Angle");
+                    ImGui::TextColored(uiAccent, "Source Position, Type & Amplitude");
 
                     int min_valid_grid = ctx.npml + 5;
                     int max_valid_x = ctx.NX - ctx.npml - 5;
                     int max_valid_z = ctx.NZ - ctx.npml - 5;
 
+                    // 1. 坐标位置调节
                     ImGui::SliderInt("Source X (Grid)", &edit_src_x, min_valid_grid, max_valid_x);
                     ImGui::SliderInt("Source Z (Grid)", &edit_src_z, min_valid_grid, max_valid_z);
-                    ImGui::SliderFloat("Force Angle", &edit_angle, -180.0f, 180.0f, "%.1f deg");
+                    ImGui::Spacing();
+
+                    // 2. 新增：激发幅值调节滑动条
+                    ImGui::SliderFloat("Excitation Amp", &edit_amp, 0.1f, 10.0f, "%.1f x");
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Adjust the source intensity in real-time.");
+                    }
+
+                    // 3. 新增：物理震源激发类型选择 Combo (与您给出的图片完美对应)
+                    const char* source_types[] = {
+                        "Vertical Force (Tzz)",
+                        "Horizontal Force (Txx)",
+                        "Explosive (Txx + Tzz)",
+                        "Shear (Txz)",
+                        "Rotated Force"
+                    };
+                    ImGui::Combo("Source Type", &edit_source_type, source_types, IM_ARRAYSIZE(source_types));
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Select seismic source mechanism (e.g. Pure P-Wave or Shear S-Wave).");
+                    }
+
+                    // 4. 优化：仅在选择“倾斜力 (Rotated Force)”时，才显示受力角度调节，保持面板整洁
+                    if (edit_source_type == 4) {
+                        ImGui::SliderFloat("Force Angle", &edit_angle, -180.0f, 180.0f, "%.1f deg");
+                    }
 
                     ImGui::Separator();
                     ImGui::TextColored(uiAccent, "Ricker Wavelet Properties");
@@ -2548,7 +2595,7 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                         float t = i * preview_dt - edit_t0;
                         float pi2_f0 = M_PI * M_PI * edit_f0 * edit_f0;
                         preview_x[i] = i * preview_dt;
-                        preview_y[i] = (1.0f - 2.0f * pi2_f0 * t * t) * expf(-pi2_f0 * t * t);
+                        preview_y[i] = (1.0f - 2.0f * pi2_f0 * t * t) * expf(-pi2_f0 * t * t) * edit_amp; // 预览同样应用幅值
                     }
 
                     ImPlot::PushStyleColor(ImPlotCol_FrameBg, IM_COL32(125, 125, 125, 255));
@@ -2558,7 +2605,7 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
 
                     if (ImPlot::BeginPlot("##WaveletPreview", ImVec2(-1, 95 * scale), ImPlotFlags_NoLegend)) {
                         ImPlot::SetupAxes("Time", "Amp", ImPlotAxisFlags_NoTickLabels, ImPlotAxisFlags_NoTickLabels);
-                        ImPlot::SetupAxesLimits(0.0f, 200 * preview_dt, -1.1f, 1.1f);
+                        ImPlot::SetupAxesLimits(0.0f, 200 * preview_dt, -1.1f * edit_amp, 1.1f * edit_amp);
                         ImPlot::PlotLine("Ricker", preview_x.data(), preview_y.data(), 200);
                         ImPlot::EndPlot();
                     }
@@ -2569,6 +2616,8 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                         ctx.src_z_idx = edit_src_z;
                         ctx.src_idx = edit_src_z * ctx.NX + edit_src_x;
                         ctx.src_angle = edit_angle;
+                        ctx.src_type = edit_source_type; // 更新激发类型
+                        ctx.src_amp = edit_amp;         // 更新激发幅值
 
                         par.FDM.f0 = edit_f0;
                         par.FDM.t0 = edit_t0;
@@ -2587,6 +2636,8 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                         multi_source_mode = false;
                         ctx.src_z_idx = edit_src_z;
                         ctx.src_idx = edit_src_z * ctx.NX + edit_src_x;
+                        ctx.src_type = edit_source_type; // 一键激发时应用当前类型
+                        ctx.src_amp = edit_amp;         // 一键激发时应用当前幅值
                         g_resetSimRequested = true;
                     }
                     ImGui::Spacing();
@@ -2696,8 +2747,6 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                                 popup_message = "Failed to load model file.\nPlease check file formatting or dimensions.";
                                 show_error_popup = true;
                             }
-                            modelStyle = 1;
-                            showGrid = false;
                         }
                         else {
                             popup_message = "Error: Please select a TXT model file first!";
@@ -2770,8 +2819,6 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                             popup_message = "Error: Please select all three SGY files (Vp, Vs, Rho)!";
                             show_error_popup = true;
                         }
-                        modelStyle = 1;
-                        showGrid = false;
                     }
                     ImGui::Spacing();
                     ImGui::PopStyleColor(2);
@@ -2967,8 +3014,18 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                 // ==========================================
                 if (ImGui::BeginTabItem("visual")) {
                     ImGui::Spacing();
-                    ImGui::SliderFloat("Color Gain", &color_scale, 0.1f, 100.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-                    const char* components[] = { "Vz (Vertical)", "Vx (Horizontal)" };
+                    ImGui::SliderFloat("Color Gain", &color_scale, 0.01f, 100.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
+
+                    // 完全对齐图片中的专业物理场分量类别
+                    const char* components[] = {
+                        "Velocity Mag",
+                        "Velocity X",
+                        "Velocity Y",
+                        "Stress Normal",
+                        "Stress Shear",
+                        "P-Wave (Div)",
+                        "S-Wave (Curl)"
+                    };
                     ImGui::Combo("Show Component", &show_component, components, IM_ARRAYSIZE(components));
 
                     ImGui::Spacing();

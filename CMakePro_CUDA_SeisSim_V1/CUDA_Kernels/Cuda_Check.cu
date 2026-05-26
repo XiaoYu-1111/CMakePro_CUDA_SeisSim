@@ -534,15 +534,66 @@ __global__ void update_type3_velocity_kernel(GPUSimData g) {
 }
 
 // --- Source Injection ---
-__global__ void inject_source_kernel(GPUSimData g, float force_x, float force_z, int src_idx) {
-    if (g.flag_type == 1 || g.flag_type == 3) {
-        g.d_vx_1[src_idx] += force_x * g.dt / g.d_rho[src_idx];
-        float rho_avg = 0.25f * (g.d_rho[src_idx] + g.d_rho[src_idx + 1] + g.d_rho[src_idx + g.NX] + g.d_rho[src_idx + g.NX + 1]);
-        g.d_vz_1[src_idx] += force_z * g.dt / rho_avg;
+__global__ void inject_source_kernel(GPUSimData g, float wavelet_val, int src_idx) {
+    // g.src_type:
+    // 0: Vertical Force (Tzz) - 垂直方向集中力，直接作用于 Vz 分量
+    // 1: Horizontal Force (Txx) - 水平方向集中力，直接作用于 Vx 分量
+    // 2: Explosive (Txx + Tzz) - 各向同性膨胀压力源 (纯 P 波)，直接注入正应力张量
+    // 3: Shear (Txz) - 纯剪切源 (生成强 S 波)，直接注入剪应力张量
+    // 4: Rotated Force - 倾斜方向力源，根据 g.src_angle 分解并作用于 Vx 和 Vz
+
+    if (g.src_type == 0) { // 垂直集中力
+        float force_z = wavelet_val;
+        if (g.flag_type == 1 || g.flag_type == 3) {
+            float rho_avg = 0.25f * (g.d_rho[src_idx] + g.d_rho[src_idx + 1] + g.d_rho[src_idx + g.NX] + g.d_rho[src_idx + g.NX + 1]);
+            g.d_vz_1[src_idx] += force_z * g.dt / rho_avg;
+        }
+        else if (g.flag_type == 2) {
+            g.d_vz[src_idx] += force_z * g.dt / g.d_rho_x_z_flat[src_idx];
+        }
     }
-    else if (g.flag_type == 2) {
-        g.d_vx[src_idx] += force_x * g.dt / g.d_rho_orig_flat[src_idx];
-        g.d_vz[src_idx] += force_z * g.dt / g.d_rho_x_z_flat[src_idx];
+    else if (g.src_type == 1) { // 水平集中力
+        float force_x = wavelet_val;
+        if (g.flag_type == 1 || g.flag_type == 3) {
+            g.d_vx_1[src_idx] += force_x * g.dt / g.d_rho[src_idx];
+        }
+        else if (g.flag_type == 2) {
+            g.d_vx[src_idx] += force_x * g.dt / g.d_rho_orig_flat[src_idx];
+        }
+    }
+    else if (g.src_type == 2) { // 膨胀震源 (纯压缩 P 波，无横波分量) -> 作用于对角应力张量 [2]
+        if (g.flag_type == 1 || g.flag_type == 3) {
+            g.d_sxx_1[src_idx] += wavelet_val * 0.5f;
+            g.d_sxx_2[src_idx] += wavelet_val * 0.5f;
+            g.d_szz_1[src_idx] += wavelet_val * 0.5f;
+            g.d_szz_2[src_idx] += wavelet_val * 0.5f;
+        }
+        else if (g.flag_type == 2) {
+            g.d_sigmaxx[src_idx] += wavelet_val;
+            g.d_sigmazz[src_idx] += wavelet_val;
+        }
+    }
+    else if (g.src_type == 3) { // 剪切震源 (剪切波) -> 作用于离角剪切应力张量 Sxz
+        if (g.flag_type == 1 || g.flag_type == 3) {
+            g.d_sxz_1[src_idx] += wavelet_val * 0.5f;
+            g.d_sxz_2[src_idx] += wavelet_val * 0.5f;
+        }
+        else if (g.flag_type == 2) {
+            g.d_sigmaxz[src_idx] += wavelet_val;
+        }
+    }
+    else if (g.src_type == 4) { // 任意倾斜力源 (Rotated Force)
+        float force_x = sinf(g.src_angle * M_PI / 180.0f) * wavelet_val;
+        float force_z = cosf(g.src_angle * M_PI / 180.0f) * wavelet_val;
+        if (g.flag_type == 1 || g.flag_type == 3) {
+            g.d_vx_1[src_idx] += force_x * g.dt / g.d_rho[src_idx];
+            float rho_avg = 0.25f * (g.d_rho[src_idx] + g.d_rho[src_idx + 1] + g.d_rho[src_idx + g.NX] + g.d_rho[src_idx + g.NX + 1]);
+            g.d_vz_1[src_idx] += force_z * g.dt / rho_avg;
+        }
+        else if (g.flag_type == 2) {
+            g.d_vx[src_idx] += force_x * g.dt / g.d_rho_orig_flat[src_idx];
+            g.d_vz[src_idx] += force_z * g.dt / g.d_rho_x_z_flat[src_idx];
+        }
     }
 }
 
@@ -572,8 +623,37 @@ __global__ void zero_boundary_kernel(GPUSimData g) {
         }
     }
 }
+// =============================================================================
+// 【新增】：设备端安全越界钳位速度提取函数 (用于高阶有限差分求导)
+// =============================================================================
+// =============================================================================
+// 【安全修复】：使用三目运算符彻底规避 windows.h 宏冲突与平台编译问题
+// =============================================================================
+__device__ float get_vx(const GPUSimData& g, int i, int j) {
+    // 替代 max(0, min(i, g.NZ - 1))
+    int r = (i < 0) ? 0 : ((i > g.NZ - 1) ? g.NZ - 1 : i);
+    // 替代 max(0, min(j, g.NX - 1))
+    int c = (j < 0) ? 0 : ((j > g.NX - 1) ? g.NX - 1 : j);
 
-// --- Colormap Generator ---
+    int k = r * g.NX + c;
+    return (g.flag_type == 1 || g.flag_type == 3) ? (g.d_vx_1[k] + g.d_vx_2[k]) : g.d_vx[k];
+}
+
+__device__ float get_vz(const GPUSimData& g, int i, int j) {
+    // 替代 max(0, min(i, g.NZ - 1))
+    int r = (i < 0) ? 0 : ((i > g.NZ - 1) ? g.NZ - 1 : i);
+    // 替代 max(0, min(j, g.NX - 1))
+    int c = (j < 0) ? 0 : ((j > g.NX - 1) ? g.NX - 1 : j);
+
+    int k = r * g.NX + c;
+    return (g.flag_type == 1 || g.flag_type == 3) ? (g.d_vz_1[k] + g.d_vz_2[k]) : g.d_vz[k];
+}
+// =============================================================================
+// 【重构】：7 分量多重波场自适应实时色彩映射核函数 [2]
+// =============================================================================
+// =============================================================================
+// 【自适应物理平衡】：7 分量多重波场自适应实时色彩映射核函数
+// =============================================================================
 __global__ void generate_colormap_kernel(GPUSimData g, uchar4* rgba_out, float scale, int component) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     int i = blockIdx.y * blockDim.y + threadIdx.y;
@@ -581,24 +661,83 @@ __global__ void generate_colormap_kernel(GPUSimData g, uchar4* rgba_out, float s
     if (i < g.NZ && j < g.NX) {
         int k = i * g.NX + j;
         float val = 0.0f;
+        float component_balancer = 1.0f; // 针对不同物理分量的自适应增益平衡因子
 
-        if (component == 0) { // Vz
-            val = (g.flag_type == 1 || g.flag_type == 3) ? (g.d_vz_1[k] + g.d_vz_2[k]) : g.d_vz[k];
+        if (component == 0) {
+            // 1. Velocity Mag
+            float vx = get_vx(g, i, j);
+            float vz = get_vz(g, i, j);
+            val = sqrtf(vx * vx + vz * vz);
+            component_balancer = 1.0f;
         }
-        else { // Vx
-            val = (g.flag_type == 1 || g.flag_type == 3) ? (g.d_vx_1[k] + g.d_vx_2[k]) : g.d_vx[k];
+        else if (component == 1) {
+            // 2. Velocity X
+            val = get_vx(g, i, j);
+            component_balancer = 1.0f;
+        }
+        else if (component == 2) {
+            // 3. Velocity Y (Z)
+            val = get_vz(g, i, j);
+            component_balancer = 1.0f;
+        }
+        else if (component == 3) {
+            // 4. Stress Normal (Sxx + Szz)
+            float stress = 0.0f;
+            if (g.flag_type == 1 || g.flag_type == 3) {
+                stress = g.d_sxx_1[k] + g.d_sxx_2[k] + g.d_szz_1[k] + g.d_szz_2[k];
+            }
+            else if (g.flag_type == 2) {
+                stress = g.d_sigmaxx[k] + g.d_sigmazz[k];
+            }
+
+            // 【物理归一化】：应力数值极大（GPa量级），除以本地纵波拉梅常数转换为应变尺度（10^-6 ~ 10^-3）
+            float lam2mu = g.d_lambda2mu[k];
+            val = (lam2mu > 1000.0f) ? (stress / lam2mu) : stress;
+            val *= 1000;//处理后变小，需要继续增大1000左右
+            component_balancer = 2.0f; // 归一化后的微调增益
+        }
+        else if (component == 4) {
+            // 5. Stress Shear (Sxz)
+            float shear = 0.0f;
+            if (g.flag_type == 1 || g.flag_type == 3) {
+                shear = g.d_sxz_1[k] + g.d_sxz_2[k];
+            }
+            else if (g.flag_type == 2) {
+                shear = g.d_sigmaxz[k];
+            }
+
+            // 【物理归一化】：剪切应力除以剪切模量 mu
+            float mu = g.d_mu[k];
+            val = (mu > 1000.0f) ? (shear / mu) : shear;
+            val *= 1000;
+            component_balancer = 3.0f; // 归一化后的微调增益
+        }
+        else if (component == 5) {
+            // 6. P-Wave (Div): 散度 (微商数值偏小，乘以 8.0 倍补偿) [2]
+            float dvx_dx = get_vx(g, i, j) - get_vx(g, i, j - 1);
+            float dvz_dz = get_vz(g, i, j) - get_vz(g, i - 1, j);
+            val = dvx_dx + dvz_dz;
+            component_balancer = 8.0f;
+        }
+        else if (component == 6) {
+            // 7. S-Wave (Curl): 旋度 (微商数值偏小，乘以 8.0 倍补偿) [2]
+            float dvz_dx = get_vz(g, i, j) - get_vz(g, i, j - 1);
+            float dvx_dz = get_vx(g, i, j) - get_vx(g, i - 1, j);
+            val = dvz_dx - dvx_dz;
+            component_balancer = 8.0f;
         }
 
-        float norm = val * scale;
-        if (norm > 1.0f) norm = 1.0f;
+        // 应用自适应物理平衡因子，使所有通道在同一个 Color Gain 滑块下拥有高度一致的视觉密度
+        float norm = val * scale * component_balancer;
+        if (norm > 1.0f)  norm = 1.0f;
         if (norm < -1.0f) norm = -1.0f;
 
         unsigned char r = 255, g_val = 255, b = 255;
-        if (norm > 0.0f) {
+        if (norm > 0.0f) { // 正振幅 -> 红色
             g_val = static_cast<unsigned char>(255.0f * (1.0f - norm));
             b = static_cast<unsigned char>(255.0f * (1.0f - norm));
         }
-        else {
+        else { // 负振幅 -> 蓝色
             r = static_cast<unsigned char>(255.0f * (1.0f + norm));
             g_val = static_cast<unsigned char>(255.0f * (1.0f + norm));
         }
@@ -771,6 +910,10 @@ void runGPUStep(GPUSimData& gpu, int current_it, const SimulationContext& ctx, i
     dim3 block(16, 16);
     dim3 grid((gpu.NX + block.x - 1) / block.x, (gpu.NZ + block.y - 1) / block.y);
 
+    // 同步主机端控制面板的震源类型及角度到 GPU 结构体
+    gpu.src_type = ctx.src_type;
+    gpu.src_angle = ctx.src_angle;
+
     if (gpu.flag_type == 1) {
         update_type1_stress_kernel << <grid, block >> > (gpu);
     }
@@ -794,6 +937,7 @@ void runGPUStep(GPUSimData& gpu, int current_it, const SimulationContext& ctx, i
         update_type3_velocity_kernel << <grid, block >> > (gpu);
     }
 
+    // 3. Source Injection
     if (num_active_sources >= 0) {
         if (num_active_sources > 0) {
             inject_multi_sources_kernel << <1, num_active_sources >> > (gpu, gpu.d_active_sources, num_active_sources);
@@ -801,12 +945,13 @@ void runGPUStep(GPUSimData& gpu, int current_it, const SimulationContext& ctx, i
     }
     else {
         if (current_it < ctx.nt) {
-            float wavelet_val = ctx.wavelet[current_it] * 1e7f;
-            float force_x = sinf(ctx.src_angle * M_PI / 180.0f) * wavelet_val;
-            float force_z = cosf(ctx.src_angle * M_PI / 180.0f) * wavelet_val;
+            // 在注入时，直接将基础子波值乘以幅值增益系数 ctx.src_amp，实现零时延实时调控
+            float wavelet_val = ctx.wavelet[current_it] * ctx.src_amp * 1e7f;
+
             int safe_src_z = (gpu.flag_type == 3) ? std::max(ctx.src_z_idx, gpu.fs_idx + 1) : ctx.src_z_idx;
             int src_idx = safe_src_z * gpu.NX + (ctx.src_idx % gpu.NX);
-            inject_source_kernel << <1, 1 >> > (gpu, force_x, force_z, src_idx);
+
+            inject_source_kernel << <1, 1 >> > (gpu, wavelet_val, src_idx);
         }
     }
 
