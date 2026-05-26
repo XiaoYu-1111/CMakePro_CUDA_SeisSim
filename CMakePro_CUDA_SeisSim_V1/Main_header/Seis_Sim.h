@@ -46,13 +46,19 @@ inline int edit_h = 500;
 inline float edit_f0 = 100.0f;
 inline float edit_t0 = 1/edit_f0;
 
+inline float temp_dt = 0.0002f;
+inline float temp_dx = 1.0f;
+inline int temp_nt = 10000;
+inline int temp_pml = 50;
+
 // --- 时间演化与渲染属性 ---
 inline int current_it = 0;
 inline float accumulated_compute_time = 0.0f;
 inline float color_scale = 10.0f;
 inline int show_component = 0; // 0: Vz, 1: Vx
-inline int steps_per_frame = 10;
+inline int steps_per_frame = 20;
 inline bool showHUD = true;
+inline bool show_Monitor_par = false;
 inline int waveStyle = 0; // 默认采用 Style 0: Magma Glow
 
 // --- 物理震源位置与受力角度 ---
@@ -101,6 +107,70 @@ inline bool showGrid = true; // 默认开启背景网格与矩阵点显示
 inline static bool show_success_popup = false;
 inline static bool show_error_popup = false;
 inline static std::string popup_message="";
+
+// =============================================================================
+// 【高级缓存】：CPU 侧物理极值与显存估算缓存（避开每帧循环 400 万点导致的 FPS 暴降瓶颈） [3]
+// =============================================================================
+inline float cached_max_vp = 0.0f;
+inline float cached_min_vp = 0.0f;
+inline float cached_max_vs = 0.0f;
+inline float cached_min_vs = 0.0f;
+inline float cached_max_rho = 0.0f;
+inline float cached_min_rho = 0.0f;
+inline float cached_vram_mb = 0.0f; // 估算显存占用
+
+// =============================================================================
+// 【核心新增】：外部导入时原 SEG-Y 测线的实际道间距（物理间距，单位：米） [3]
+//  用于自适应重采样（例如 301 道、0.1m 间距的 30m 模型会自动重构为 31 个 1m 的仿真网格点）
+// =============================================================================
+inline float edit_segy_dx = 1.0f;
+
+inline void RecalculateCachedModelMetrics() {
+    if (ctx.total_grid <= 0) return;
+
+    float max_p = -1e20f, min_p = 1e20f;
+    float max_s = -1e20f, min_s = 1e20f;
+    float max_r = -1e20f, min_r = 1e20f;
+
+    for (int i = 0; i < ctx.total_grid; ++i) {
+        float rho = ctx.rho[i];
+        float vp = 0.0f;
+        float vs = 0.0f;
+        if (rho > 0.0f) {
+            vp = sqrtf(ctx.lambda2mu[i] / rho);
+            vs = sqrtf(ctx.mu[i] / rho);
+        }
+
+        // 避开最顶端的低速空气层，以显示真实地下岩层的速度范围
+        if (vp > 350.0f) {
+            if (vp > max_p) max_p = vp;
+            if (vp < min_p) min_p = vp;
+            if (vs > max_s) max_s = vs;
+            if (vs < min_s) min_s = vs;
+            if (rho > max_r) max_r = rho;
+            if (rho < min_r) min_r = rho;
+        }
+    }
+
+    // 防呆保护
+    if (max_p == -1e20f) {
+        max_p = 2000.0f; min_p = 2000.0f;
+        max_s = 1400.0f; min_s = 1400.0f;
+        max_r = 2000.0f; min_r = 2000.0f;
+    }
+
+    cached_max_vp = max_p;
+    cached_min_vp = min_p;
+    cached_max_vs = max_s;
+    cached_min_vs = min_s;
+    cached_max_rho = max_r;
+    cached_min_rho = min_r;
+
+    // 估算 GPU 在此尺寸下分配的所有 2D 物理场与系数显存
+    // 包含应力、速度、PML 分裂场、物性等共约 20 个双精度/单精度二维浮点显存块 [3]
+    size_t estimated_bytes = ctx.total_grid * sizeof(float) * 20;
+    cached_vram_mb = static_cast<float>(estimated_bytes) / (1024.0f * 1024.0f);
+}
 
 // =============================================================================
 // 2. 标尺绘制模块 (Symmetric Titanium Background 风格自适应物理标尺)
@@ -299,6 +369,158 @@ inline void RenderSourceMarker(
         float pulse = (sin(t * 3.0f) * 0.5f + 0.5f) * 5.0f;
         fg->AddCircle(pos, 5.0f + pulse, IM_COL32(125, 255, 125, 155), 16, 1.0f);
     }
+}
+// 简单的雷克子波产生器
+void generateRickerWavelet(std::vector<float>& wavelet, int nt, float dt, float f0, float t0) {
+    wavelet.resize(nt);
+    for (int i = 0; i < nt; ++i) {
+        float t = i * dt - t0;
+        float pi2_f0 = M_PI * M_PI * f0 * f0;
+        wavelet[i] = (1.0f - 2.0f * pi2_f0 * t * t) * expf(-pi2_f0 * t * t);
+    }
+}
+
+// =============================================================================
+// 【物理核心】：根据当前网格物性最大波速 Vp_max、PML 宽度 npml 和网格间距 h，
+//  重新计算并更新 CPU 端高阶 Staggered-grid 2.5 阶黄金 PML 阻尼衰减系数数组！
+//  每次重置模拟、切换场景、改变网格大小或滑动条应用时，该函数都会自动触发，保证绝对对齐。
+// =============================================================================
+inline void UpdatePmlDampingArrays() {
+    float max_vp = 0.0f;
+    for (int k = 0; k < ctx.total_grid; ++k) {
+        float vp = sqrtf(ctx.lambda2mu[k] / ctx.rho[k]);
+        if (vp > max_vp) max_vp = vp;
+    }
+
+    ctx.dx.assign(ctx.NX, 0.0f);
+    ctx.dx_half.assign(ctx.NX, 0.0f);
+    ctx.dz.assign(ctx.NZ, 0.0f);
+    ctx.dz_half.assign(ctx.NZ, 0.0f);
+
+    if (ctx.npml > 0) {
+        float L = ctx.npml * ctx.h; // PML 吸收层物理总厚度
+
+        // 采用 3.5 倍的学术级阻尼安全余量，配合 2.5 阶黄金阻尼，彻底根除流固发散
+        float d_max = (3.0f * max_vp * 16.12f * 3.5f) / (2.0f * L);
+        float pml_power = 2.5f;
+
+        // X 轴 PML 阻尼系数初始化 (交错网格 0.5 半步长偏移对齐) [6]
+        for (int i = 0; i < ctx.npml; ++i) {
+            float x_thick = (ctx.npml - i) / (float)ctx.npml;
+            float x_thick_half = (ctx.npml - (i + 0.5f)) / (float)ctx.npml;
+            if (x_thick_half < 0.0f) x_thick_half = 0.0f;
+
+            float val = d_max * powf(x_thick, pml_power);
+            float val_half = d_max * powf(x_thick_half, pml_power);
+
+            ctx.dx[i] = val;
+            ctx.dx[ctx.NX - 1 - i] = val;
+            ctx.dx_half[i] = val_half;
+            ctx.dx_half[ctx.NX - 1 - i] = val_half;
+        }
+
+        // Z 轴 PML 阻尼系数初始化
+        for (int i = 0; i < ctx.npml; ++i) {
+            float z_thick = (ctx.npml - i) / (float)ctx.npml;
+            float z_thick_half = (ctx.npml - (i + 0.5f)) / (float)ctx.npml;
+            if (z_thick_half < 0.0f) z_thick_half = 0.0f;
+
+            float val = d_max * powf(z_thick, pml_power);
+            float val_half = d_max * powf(z_thick_half, pml_power);
+
+            ctx.dz[i] = val;
+            ctx.dz[ctx.NZ - 1 - i] = val;
+            ctx.dz_half[i] = val_half;
+            ctx.dz_half[ctx.NZ - 1 - i] = val_half;
+        }
+    }
+}
+
+// 模拟测试上下文初始化
+void setupTestContext(SimulationContext& ctx, const Parameters& par) {
+    ctx.NX = par.model.xnum;
+    ctx.NZ = par.model.znum;
+    ctx.total_grid = ctx.NX * ctx.NZ;
+    ctx.dt = par.FDM.dt;
+    ctx.nt = static_cast<int>(par.FDM.nt);
+    ctx.npml = static_cast<int>(par.FDM.npml);
+
+    // =============================================================================
+    // 【核心修复 1】：取消硬编码 ctx.flag_type = 3
+    // 仅在首次启动未初始化（值为 0）时设为默认值 3；其余情况继承并保留用户在 UI 上的选择
+    // =============================================================================
+    if (ctx.flag_type == 0) {
+        ctx.flag_type = 3;
+    }
+
+    ctx.upFlag = (par.FDM.upFlag > 0.5f);
+
+    // 这里以 par.model.dx 为准（或者 par.FDM.xPace，两者在物理上是一致的）
+    float h = par.model.dx;
+    if (h <= 0.0f) h = 1.0f; // 防呆保护
+    ctx.h = h;
+
+    temp_dx = h;
+    temp_dt = ctx.dt;
+    temp_nt = ctx.nt;
+    temp_pml = ctx.npml;
+
+    // 将无单位的 8 阶有限差分系数除以空间步长 h 
+    ctx.c1_h = 1.125022f / h;
+    ctx.c2_h = -0.04687594f / h;
+    ctx.c3_h = 0.00416669f / h;
+    ctx.c4_h = -0.00019234f / h;
+
+    // =============================================================================
+    // 【核心修复 2】：取消本地 static 变量
+    // 直接读取我们刚刚定义在头文件最顶部的、与 UI 强绑定的全局共享物性变量 [3]
+    // =============================================================================
+    float mu_val = edit_Density * edit_Vs * edit_Vs;
+    float lambda2mu_val = edit_Density * edit_Vp * edit_Vp;
+    float lambda_val = lambda2mu_val - 2.0f * mu_val;
+
+    // 重新填充本地 Context (防止重算时参数被覆盖回滚)
+    ctx.rho.assign(ctx.total_grid, edit_Density);
+    ctx.mu.assign(ctx.total_grid, mu_val);
+    ctx.lambda.assign(ctx.total_grid, lambda_val);
+    ctx.lambda2mu.assign(ctx.total_grid, lambda2mu_val);
+
+    // =============================================================================
+    // 【核心精简】：直接调用重构后的 PML 阻尼曲线重算函数，实现单一逻辑出口！
+    // =============================================================================
+    UpdatePmlDampingArrays();
+    // 自由表面 dp_flat 计算 (保持不变)
+    {
+        ctx.dp_flat.assign(ctx.NX, 0.0f);
+        int fs_idx = ctx.npml;
+        for (int j = 0; j < ctx.NX; ++j) {
+            int k = fs_idx * ctx.NX + j;
+            if (k < ctx.total_grid && ctx.lambda2mu[k] > 0.0f) {
+                float l2m = ctx.lambda2mu[k];
+                float lam = ctx.lambda[k];
+                ctx.dp_flat[j] = (l2m * l2m - lam * lam) / l2m;
+            }
+        }
+    }
+    //震源
+    ctx.src_z_idx = ctx.NZ / 4;                                      // Z轴深度设定在 1/4 处
+    ctx.src_idx = ctx.src_z_idx * ctx.NX + (ctx.NX / 2);             // X轴定位在中心 1/2 处
+    ctx.src_angle = par.FDM.angle;
+    generateRickerWavelet(ctx.wavelet, ctx.nt, ctx.dt, par.FDM.f0, par.FDM.t0);
+
+    // 检波器 (中间水平放一行检波器)
+    ctx.num_rcv = 100;
+    ctx.rcv_grid_idx.resize(ctx.num_rcv);
+    int rcv_z = ctx.NZ / 2 + 30; // 震源下方 30 采样点
+    int step = ctx.NX / ctx.num_rcv;
+    for (int r = 0; r < ctx.num_rcv; ++r) {
+        ctx.rcv_grid_idx[r] = rcv_z * ctx.NX + (r * step);
+    }
+
+    ctx.record_vx.assign(ctx.num_rcv * ctx.nt, 0.0f);
+    ctx.record_vz.assign(ctx.num_rcv * ctx.nt, 0.0f);
+
+    RecalculateCachedModelMetrics();
 }
 
 
@@ -620,98 +842,17 @@ inline void ApplyScenario(int type, SimState& state) {
 
     // 1. 确保 CPU 物理场上下文 NX/NZ、步长、c1_h等完全建立
     setupTestContext(ctx, par);
-
     // 2. 根据场景类型，精确定制重写 CPU 数组（此时 rho, mu, lambda2mu 被写入地壳/水层等真实参数）
     LoadScenario(type);
+    // =============================================================================
+    // 【核心修复 1】：由于 LoadScenario 重置了物性参数，必须在这里重新根据新场景的
+    //  实际最大纵波速度，重新计算并匹配最新、最完美的 PML 阻尼吸收线！
+    // =============================================================================
+    UpdatePmlDampingArrays();
 
-    // 3. 注销并重装 GPU 显存
-    freeGPUSimulation(gpu_data);
-    initGPUSimulation(gpu_data, ctx);
-
-    // 4. 同步更新地质背景图纹理
-    UpdateModelTexture();
-}
-// =============================================================================
-// 【高级模型加载器】：从您的自定义 3-Component 文本文件中高精度载入地质模型
-//  1. 完美解析 "# Dimensions" 自定义标定头
-//  2. 100% 物理对齐：处理 flipVertically，确保加载后地表 (0m) 绝对居顶
-//  3. 自动同步 CPU 弹性参数、OpenGL 纹理尺寸，并一键重装 GPU 显存，防止越界闪退
-// =============================================================================
-// 确保函数签名接收 gl 和 state 参数，以解决作用域引用问题 [3]
-inline bool LoadModelFromTxt(const std::string& filename, bool flipVertically, GLHandles& gl, SimState& state) {
-    std::cout << "[IO] Loading custom ASCII model: " << filename << " (Flip Y: " << (flipVertically ? "Yes" : "No") << ")" << std::endl;
-
-    std::ifstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "[IO] Error: Could not open model file: " << filename << std::endl;
-        return false;
-    }
-
-    // ... 1. 解析 Dimensions 头部代码 (保持不变) ...
-    std::string line;
-    int file_w = 0, file_h = 0;
-    bool dimensionsFound = false;
-    while (std::getline(file, line)) {
-        if (line.rfind("# Dimensions", 0) == 0) {
-            sscanf_s(line.c_str(), "# Dimensions (Width x Height): %d %d", &file_w, &file_h);
-            if (file_w > 0 && file_h > 0) dimensionsFound = true;
-            break;
-        }
-    }
-
-    if (!dimensionsFound) {
-        std::cerr << "[IO] Error: Missing '# Dimensions' header." << std::endl;
-        return false;
-    }
-
-    // 2. 模拟重载安全拦截
-    state.running = false; // <-- 成功利用参数访问
-    current_it = 0;
-    accumulated_compute_time = 0.0f;
-    active_sources.clear();
-
-    edit_w = file_w;
-    edit_h = file_h;
-    par.model.xnum = edit_w;
-    par.model.znum = edit_h;
-
-    setupTestContext(ctx, par);
-
-    // 3. 逐行解析数据
-    file.clear();
-    file.seekg(0, std::ios::beg);
-
-    int pixelCount = 0;
-    while (std::getline(file, line)) {
-        if (line.empty() || line[0] == '#') continue;
-
-        std::stringstream ss(line);
-        float vp = 0.0f, vs = 0.0f, rho = 0.0f;
-        if (!(ss >> vp >> vs >> rho)) continue;
-
-        if (pixelCount >= ctx.total_grid) break;
-
-        int currentX = pixelCount % ctx.NX;
-        int currentY = pixelCount / ctx.NX;
-
-        int targetX = currentX;
-        int targetY = currentY;
-
-        if (flipVertically) {
-            targetY = ctx.NZ - 1 - currentY; // 垂直地表对齐
-        }
-
-        SetMaterialAt(targetX, targetY, vp, vs, rho);
-        pixelCount++;
-    }
-    file.close();
-
-    // 4. 重置激发位置与 PML 表面波
-    ctx.src_z_idx = ctx.NZ / 4;
-    ctx.src_idx = ctx.src_z_idx * ctx.NX + (ctx.NX / 2);
-    edit_src_x = ctx.NX / 2;
-    edit_src_z = ctx.NZ / 4;
-
+    // =============================================================================
+    // 【核心修复 2】：重新计算物理对齐的 dp_flat (保持不变)
+    // =============================================================================
     ctx.dp_flat.assign(ctx.NX, 0.0f);
     int fs_idx = ctx.npml;
     for (int j = 0; j < ctx.NX; ++j) {
@@ -722,21 +863,16 @@ inline bool LoadModelFromTxt(const std::string& filename, bool flipVertically, G
             ctx.dp_flat[j] = (l2m * l2m - lam * lam) / l2m;
         }
     }
-
-    // 5. 释放并安全重写显存
+    
+    // 3. 注销并重装 GPU 显存
     freeGPUSimulation(gpu_data);
-    cudaGraphicsUnregisterResource(gl.cudaSeisRes); // <-- 成功利用参数访问
-    glBindTexture(GL_TEXTURE_2D, gl.seisTex);       // <-- 成功利用参数访问
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ctx.NX, ctx.NZ, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    cudaGraphicsGLRegisterImage(&gl.cudaSeisRes, gl.seisTex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
-
     initGPUSimulation(gpu_data, ctx);
 
-    UpdateModelTexture(); // 重写地质背景纹理
-    first_align_needed = true;
-
-    return true;
+    // 4. 同步更新地质背景图纹理
+    UpdateModelTexture();
+    RecalculateCachedModelMetrics();
 }
+
 // --- Open File Dialog ---
 inline bool OpenSystemFileDialog(char* buffer, int bufferSize) {
     // Clear the buffer
@@ -907,6 +1043,166 @@ inline std::vector<std::vector<float>> PadPmlToGrid2D(
 }
 
 // =============================================================================
+// 升级版 TXT 导入器：全面引入列优先重采样与 PML 扩边流体稳定化管线
+//  1. 解析 '# Dimensions' 头部后，将数据统一读入临时 CPU 2D 数组。
+//  2. 自动进行重采样 (对齐系统当前 dx) 与边缘物性平滑外推 (Pad & Fluid Stabilizer)。
+//  3. 安全重设 OpenGL 纹理尺寸，一键重装 GPU 显存，彻底消灭由于边界漏波或剪切模量为 0 导致的发散！
+// =============================================================================
+inline bool LoadModelFromTxt(const std::string& filename, bool flipVertically, GLHandles& gl, SimState& state) {
+    std::cout << "[IO] Loading custom ASCII model: " << filename << " (Flip Y: " << (flipVertically ? "Yes" : "No") << ")" << std::endl;
+
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "[IO] Error: Could not open model file: " << filename << std::endl;
+        return false;
+    }
+
+    // 1. 解析 Dimensions 头部尺寸
+    std::string line;
+    int file_w = 0, file_h = 0;
+    bool dimensionsFound = false;
+    while (std::getline(file, line)) {
+        if (line.rfind("# Dimensions", 0) == 0) {
+            sscanf_s(line.c_str(), "# Dimensions (Width x Height): %d %d", &file_w, &file_h);
+            if (file_w > 0 && file_h > 0) dimensionsFound = true;
+            break;
+        }
+    }
+
+    if (!dimensionsFound) {
+        std::cerr << "[IO] Error: Missing '# Dimensions' header." << std::endl;
+        return false;
+    }
+
+    // 创建 CPU 临时 2D 原始物性数组
+    std::vector<std::vector<float>> raw_vp(file_w, std::vector<float>(file_h, 0.0f));
+    std::vector<std::vector<float>> raw_vs(file_w, std::vector<float>(file_h, 0.0f));
+    std::vector<std::vector<float>> raw_rho(file_w, std::vector<float>(file_h, 0.0f));
+
+    file.clear();
+    file.seekg(0, std::ios::beg);
+
+    // 2. 逐行解析并装入临时数组
+    int pixelCount = 0;
+    int total_pixels = file_w * file_h;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+
+        std::stringstream ss(line);
+        float vp = 0.0f, vs = 0.0f, rho = 0.0f;
+        if (!(ss >> vp >> vs >> rho)) continue;
+
+        if (pixelCount >= total_pixels) break;
+
+        int currentX = pixelCount % file_w;
+        int currentY = pixelCount / file_w;
+
+        raw_vp[currentX][currentY] = vp;
+        raw_vs[currentX][currentY] = vs;
+        raw_rho[currentX][currentY] = rho;
+
+        pixelCount++;
+    }
+    file.close();
+
+    if (pixelCount < total_pixels) {
+        std::cerr << "[IO] Error: Custom model data is incomplete." << std::endl;
+        return false;
+    }
+
+    // =============================================================================
+    // 【核心新增 1】：动态重采样 (对齐系统当前的空间步长 par.model.dx)
+    //  这里假定您的自定义 TXT 模型原始间距为 1.0m (您可以根据您的 Python 脚本输出调整)
+    // =============================================================================
+    float original_txt_dx = 1.0f;
+    float target_system_dx = par.model.dx;
+
+    auto grid_vp = ResampleGrid2D(raw_vp, target_system_dx, original_txt_dx);
+    auto grid_vs = ResampleGrid2D(raw_vs, target_system_dx, original_txt_dx);
+    auto grid_rho = ResampleGrid2D(raw_rho, target_system_dx, original_txt_dx);
+
+    // =============================================================================
+    // 【核心新增 2】：PML 扩边与流体安全固化 (一气呵成)
+    //  外推边界的同时，自动将 PML 阻尼层内部的水层（Vs=0）固化为剪切波速非零的固体，根治发散！
+    // =============================================================================
+    int current_npml = static_cast<int>(par.FDM.npml);
+    auto vp_pad = PadPmlToGrid2D(grid_vp, grid_vs, grid_rho, current_npml, 0); // 传 0 导 Vp
+    auto vs_pad = PadPmlToGrid2D(grid_vp, grid_vs, grid_rho, current_npml, 1); // 传 1 导 Vs
+    auto rho_pad = PadPmlToGrid2D(grid_vp, grid_vs, grid_rho, current_npml, 2); // 传 2 导 Rho
+
+    // 3. 重置模拟演化参数与最终网格宽高
+    state.running = false;
+    current_it = 0;
+    accumulated_compute_time = 0.0f;
+    active_sources.clear();
+
+    edit_w = static_cast<int>(vp_pad.size());
+    edit_h = static_cast<int>(vp_pad[0].size());
+    par.model.xnum = edit_w;
+    par.model.znum = edit_h;
+
+    // 重新在 CPU 端重组基础物理场大小
+    setupTestContext(ctx, par);
+
+    // 4. 将完美扩边与对齐的数据注入 CPU 内存
+    for (int x = 0; x < ctx.NX; ++x) {
+        for (int z = 0; z < ctx.NZ; ++z) {
+            float vp = vp_pad[x][z];
+            float vs = vs_pad[x][z];
+            float rho = rho_pad[x][z];
+
+            int targetX = x; // 如需要，在此处亦可加上水平翻转：flipHorizontally ? (ctx.NX - 1 - x) : x
+
+            int targetZ = z;
+            if (flipVertically) {
+                targetZ = ctx.NZ - 1 - z; // 垂直地表对齐
+            }
+
+            SetMaterialAt(targetX, targetZ, vp, vs, rho);
+        }
+    }
+
+    // 5. 重置震源位置与表面波 dp_flat
+    ctx.src_z_idx = ctx.NZ / 4;
+    ctx.src_idx = ctx.src_z_idx * ctx.NX + (ctx.NX / 2);
+    edit_src_x = ctx.NX / 2;
+    edit_src_z = ctx.NZ / 4;
+
+    // 核心修复：重新计算并标定最高波速下的 PML 阻尼系数 [3]
+    UpdatePmlDampingArrays();
+
+    ctx.dp_flat.assign(ctx.NX, 0.0f);
+    int fs_idx = ctx.npml;
+    for (int j = 0; j < ctx.NX; ++j) {
+        int k = fs_idx * ctx.NX + j;
+        if (k < ctx.total_grid && ctx.lambda2mu[k] > 0.0f) {
+            float l2m = ctx.lambda2mu[k];
+            float lam = ctx.lambda[k];
+            ctx.dp_flat[j] = (l2m * l2m - lam * lam) / l2m;
+        }
+    }
+
+    // 6. 释放并重新注册 FBO 纹理尺寸，防止显存崩溃
+    freeGPUSimulation(gpu_data);
+    cudaGraphicsUnregisterResource(gl.cudaSeisRes);
+    glBindTexture(GL_TEXTURE_2D, gl.seisTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ctx.NX, ctx.NZ, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    cudaGraphicsGLRegisterImage(&gl.cudaSeisRes, gl.seisTex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
+
+    // 7. 重新初始化新显存
+    initGPUSimulation(gpu_data, ctx);
+
+    // 8. 同步更新地质背景纹理，重新标定极值和视口对齐
+    UpdateModelTexture();
+    RecalculateCachedModelMetrics();
+    first_align_needed = true;
+
+    std::cout << "[IO] Custom ASCII Model Loaded, Padded and Stabilized Successfully: " << ctx.NX << "x" << ctx.NZ << std::endl;
+    return true;
+}
+
+
+// =============================================================================
 // 【高级模型加载器】：从 3 个标准的二维 SEG-Y 文件中同时载入地层物理常数 (Vp, Vs, Rho)
 //  1. 自动对齐并验证三个 SGY 文件的 NX、NZ 尺寸是否一致
 //  2. 100% 物理对齐：利用 flipVertically 确保地表 Z=0 完美对齐到视口顶端
@@ -936,7 +1232,7 @@ inline bool LoadModelFromSegy(
     }
 
     // 1. 动态重采样 (对齐我们当前系统的物理空间步长 ctx.h / par.model.dx)
-    float original_segy_dx = 1.0f;
+    float original_segy_dx = edit_segy_dx;
     float target_system_dx = par.model.dx;
 
     auto grid_vp = ResampleGrid2D(raw_vp, target_system_dx, original_segy_dx);
@@ -998,55 +1294,7 @@ inline bool LoadModelFromSegy(
             ctx.dp_flat[j] = (l2m * l2m - lam * lam) / l2m;
         }
     }
-    // =============================================================================
-    // 【核心修复】：由于加载了全新高波速的 Marmousi 模型，必须在此处自动重新提取
-    //  当前模型的最大波速，并 100% 自动重筑最匹配、最稳定的立方阶 PML 阻尼带！
-    //  这能自动适应任何外部模型的最大速度，彻底解决加载外部模型后阻尼偏小的 Bug。
-    // =============================================================================
-    float max_vp = 0.0f;
-    for (int k = 0; k < ctx.total_grid; ++k) {
-        float vp = sqrtf(ctx.lambda2mu[k] / ctx.rho[k]);
-        if (vp > max_vp) max_vp = vp;
-    }
-
-    if (ctx.npml > 0) {
-        float L = ctx.npml * ctx.h; // PML 物理总厚度
-
-        // 基于当前 Marmousi 实际最大波速 max_vp 动态重算理论最佳阻尼常数 [6]
-        // 采用我们上一轮调校出的 3.5 倍黄金阻尼与 2.5 阶衰减指数
-        float d_max = (3.0f * max_vp * 16.12f * 3.5f) / (2.0f * L);
-        float pml_power = 2.5f;
-
-        // 重新灌入 X 轴阻尼
-        for (int i = 0; i < ctx.npml; ++i) {
-            float x_thick = (ctx.npml - i) / (float)ctx.npml;
-            float x_thick_half = (ctx.npml - (i + 0.5f)) / (float)ctx.npml;
-            if (x_thick_half < 0.0f) x_thick_half = 0.0f;
-
-            float val = d_max * powf(x_thick, pml_power);
-            float val_half = d_max * powf(x_thick_half, pml_power);
-
-            ctx.dx[i] = val;
-            ctx.dx[ctx.NX - 1 - i] = val;
-            ctx.dx_half[i] = val_half;
-            ctx.dx_half[ctx.NX - 1 - i] = val_half;
-        }
-
-        // 重新灌入 Z 轴阻尼
-        for (int i = 0; i < ctx.npml; ++i) {
-            float z_thick = (ctx.npml - i) / (float)ctx.npml;
-            float z_thick_half = (ctx.npml - (i + 0.5f)) / (float)ctx.npml;
-            if (z_thick_half < 0.0f) z_thick_half = 0.0f;
-
-            float val = d_max * powf(z_thick, pml_power);
-            float val_half = d_max * powf(z_thick_half, pml_power);
-
-            ctx.dz[i] = val;
-            ctx.dz[ctx.NZ - 1 - i] = val;
-            ctx.dz_half[i] = val_half;
-            ctx.dz_half[ctx.NZ - 1 - i] = val_half;
-        }
-    }
+    UpdatePmlDampingArrays();
 
     // 5. 释放并重新注册 FBO 纹理尺寸，防止显存崩溃
     freeGPUSimulation(gpu_data);
@@ -1060,26 +1308,46 @@ inline bool LoadModelFromSegy(
 
     // 7. 同步重绘地质背景纹理，重新对齐视口标尺
     UpdateModelTexture();
+    RecalculateCachedModelMetrics();
     first_align_needed = true;
 
     return true;
 }
 
 // =============================================================================
-// 【高级模型导出器】：将当前场景中的非均匀模型逆向反推并导出为 3 个标准的 SGY 文件
-//  1. 自动在文件名后部追加 _vp.sgy、_vs.sgy、_rho.sgy。
-//  2. 逆向计算：从拉梅常数反算 Vp、Vs。
-//  3. 内存转置：将 CPU 端的行优先 (Row-Major) 矩阵转置为 SGY 标准的一道道列优先 (Column-Major) 数组。
-//  4. 密度单位自适应切换 (kg/m3 或 g/cm3)。
+// 终极版导出器：支持空间局部裁剪（Cropping）与水平翻转导出
+//  1. 自动对裁剪坐标进行安全钳位 (Clamp)，防止越界崩溃。
+//  2. 自动根据裁剪后的新尺寸 (new_NX, new_NZ) 重新计算并创建标准的二进制 SEG-Y 道头。
+//  3. 完美结合水平翻转 (flipHorizontally)，只针对裁剪出的子区域执行翻转映射。
 // =============================================================================
-// =============================================================================
-// 升级版导出器：支持导出时进行水平翻转 (flipHorizontally)
-// =============================================================================
-inline bool ExportModelToSegy(const std::string& base_filepath, bool density_gcm3, bool flipHorizontally) {
+inline bool ExportModelToSegy(
+    const std::string& base_filepath,
+    bool density_gcm3,
+    bool flipHorizontally,
+    int x_min, int z_min, // 左上角格点坐标 [1.2.7]
+    int x_max, int z_max  // 右下角格点坐标
+) {
     if (ctx.total_grid <= 0) return false;
 
-    std::cout << "[IO] Preparing SEGY Export (Flip X: " << (flipHorizontally ? "Yes" : "No") << ")..." << std::endl;
+    // 1. 安全边界检查与自适应纠错 (防止用户输入颠倒或越界坐标) [4]
+    x_min = std::clamp(x_min, 0, ctx.NX - 1);
+    x_max = std::clamp(x_max, 0, ctx.NX - 1);
+    z_min = std::clamp(z_min, 0, ctx.NZ - 1);
+    z_max = std::clamp(z_max, 0, ctx.NZ - 1);
 
+    if (x_min > x_max) std::swap(x_min, x_max);
+    if (z_min > z_max) std::swap(z_min, z_max);
+
+    // 计算裁剪后的新模型尺寸 (新宽度、新深度)
+    int new_NX = x_max - x_min + 1;
+    int new_NZ = z_max - z_min + 1;
+    size_t new_total_grid = static_cast<size_t>(new_NX) * new_NZ;
+
+    std::cout << "[IO] Preparing Cropped SEGY Export..." << std::endl;
+    std::cout << "     - Crop Range: X[" << x_min << " ~ " << x_max << "], Z[" << z_min << " ~ " << z_max << "]" << std::endl;
+    std::cout << "     - Output Size: " << new_NX << "x" << new_NZ << " (Total: " << new_total_grid << " cells)" << std::endl;
+
+    // 自动剔除原有后缀并格式化
     std::string clean_path = base_filepath;
     size_t dot_pos = clean_path.find_last_of('.');
     if (dot_pos != std::string::npos) {
@@ -1089,21 +1357,22 @@ inline bool ExportModelToSegy(const std::string& base_filepath, bool density_gcm
     std::string out_vs_path = clean_path + "_vs.sgy";
     std::string out_rho_path = clean_path + "_rho.sgy";
 
-    std::vector<float> flat_vp(ctx.total_grid, 0.0f);
-    std::vector<float> flat_vs(ctx.total_grid, 0.0f);
-    std::vector<float> flat_rho(ctx.total_grid, 0.0f);
+    // 创建裁剪后的 1D 导出缓冲区
+    std::vector<float> flat_vp(new_total_grid, 0.0f);
+    std::vector<float> flat_vs(new_total_grid, 0.0f);
+    std::vector<float> flat_rho(new_total_grid, 0.0f);
 
-    for (int x = 0; x < ctx.NX; ++x) {
-        for (int z = 0; z < ctx.NZ; ++z) {
+    // 2. 核心算法：高并发/空间转置与裁剪重组
+    for (int x = 0; x < new_NX; ++x) {
 
-            // 核心修复：根据用户要求，导出时进行水平翻转映射 [3]
-            int targetX = x;
-            if (flipHorizontally) {
-                targetX = ctx.NX - 1 - x;
-            }
+        // 如果开启了水平翻转，则对裁剪出的子区域进行左右镜像
+        int targetX = flipHorizontally ? (x_max - x) : (x_min + x);
 
-            int k_cuda = z * ctx.NX + targetX; // 映射至真实的显存物理位置
-            int k_segy = x * ctx.NZ + z;
+        for (int z = 0; z < new_NZ; ++z) {
+            int targetZ = z_min + z; // 对齐深度
+
+            int k_cuda = targetZ * ctx.NX + targetX; // 读取全网格中对应的位置
+            int k_segy = x * new_NZ + z;             // 写入新模型的 SEGY 道内位置
 
             float rho_val = ctx.rho[k_cuda];
             float vp_val = 0.0f;
@@ -1127,11 +1396,11 @@ inline bool ExportModelToSegy(const std::string& base_filepath, bool density_gcm
     }
 
     float dummy_dt = 0.001f;
-    SeismicIO::writeSegyFile2D(flat_vp, ctx.NX, ctx.NZ, out_vp_path, dummy_dt);
-    SeismicIO::writeSegyFile2D(flat_vs, ctx.NX, ctx.NZ, out_vs_path, dummy_dt);
-    SeismicIO::writeSegyFile2D(flat_rho, ctx.NX, ctx.NZ, out_rho_path, dummy_dt);
+    SeismicIO::writeSegyFile2D(flat_vp, new_NX, new_NZ, out_vp_path, dummy_dt);
+    SeismicIO::writeSegyFile2D(flat_vs, new_NX, new_NZ, out_vs_path, dummy_dt);
+    SeismicIO::writeSegyFile2D(flat_rho, new_NX, new_NZ, out_rho_path, dummy_dt);
 
-    std::cout << "[IO] Model Export Completed." << std::endl;
+    std::cout << "[IO] Cropped Model Export Completed." << std::endl;
     return true;
 }
 
@@ -1449,6 +1718,7 @@ inline void InitializeSeismicSimulation(GLHandles& gl) {
         par.model.dx = 1.0f;
         par.model.dz = 1.0f;
         par.FDM.f0 = edit_f0;
+        par.FDM.t0 = edit_t0;
 
         setupTestContext(ctx, par);
         initGPUSimulation(gpu_data, ctx);
@@ -1902,16 +2172,12 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                         if (vp > max_vp) max_vp = vp;
                     }
 
-                    static float temp_dt = ctx.dt;
-                    static float temp_dx = ctx.h;
-                    static int temp_nt = ctx.nt;
-                    static int temp_pml = ctx.npml;
-
                     ImGui::SliderFloat("Time Step (dt)", &temp_dt, 0.00001f, 0.003f, "%.6f s");
                     ImGui::SliderFloat("Grid Spacing (dx)", &temp_dx, 0.1f, 20.0f, "%.1f m");
                     // 【回归】：PML 吸收层宽度实时滑块控制 [1.2.7]
                     ImGui::SliderInt("PML Layer Width", &temp_pml, 10, 100, "%d px");
                     ImGui::SliderInt("Max Steps (nt)", &temp_nt, 500, 50000);
+
                     ImGui::SliderInt("Steps / Frame", &steps_per_frame, 1, 100);
 
                     float dt_limit = 0.5f * temp_dx / max_vp;
@@ -1936,7 +2202,10 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                         ctx.c2_h = -0.04687594f / temp_dx;
                         ctx.c3_h = 0.00416669f / temp_dx;
                         ctx.c4_h = -0.00019234f / temp_dx;
-
+                        // =============================================================================
+                        // 【核心修复】：由于 PML 宽度或网格步长变了，在此处强制重新计算并对齐 PML 阻尼曲线
+                        // =============================================================================
+                        UpdatePmlDampingArrays();
                         ctx.dp_flat.assign(ctx.NX, 0.0f);
                         int fs_idx = ctx.npml; // 自由表面自动对齐全新设置的 PML 深度 [3]
                         for (int j = 0; j < ctx.NX; ++j) {
@@ -2010,6 +2279,46 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                     if (ImGui::IsItemHovered()) {
                         ImGui::SetTooltip("Check to click and spawn multiple intersecting waves simultaneously\nUncheck for standard single-point reset mode.");
                     }
+                    ImGui::Checkbox("Enable Show Monitor par", &show_Monitor_par);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Check to click and spawn multiple intersecting waves simultaneously\nUncheck for standard single-point reset mode.");
+                    }
+                    //ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 240 * scale);
+                    ImGui::Separator();
+                    ImGui::TextColored(uiAccent, "EXECUTION CONTROLS");
+
+                    if (state.running) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.6f, 0.1f, 0.85f));
+                        if (ImGui::Button("PAUSE SIMULATION", { -1, 30 * scale })) {
+                            state.running = false;
+                        }
+                        ImGui::PopStyleColor();
+                    }
+                    else {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.65f, 0.3f, 0.85f));
+                        if (ImGui::Button("RUN SIMULATION", { -1, 30 * scale })) {
+                            state.running = true;
+                        }
+                        ImGui::PopStyleColor();
+                    }
+
+                    if (ImGui::Button("RESET SIMULATION", { -1, 28 * scale })) {
+                        g_resetSimRequested = true;
+                    }
+
+                    if (ImGui::Button("RESET VIEWPORT", { -1, 28 * scale })) {
+                        g_resetViewportRequested = true;
+                    }
+
+                    // =========================================================
+                    // 【新增】：一键唤醒/打开 SEG-Y 地震数据分析仪按钮 [1.2.7]
+                    // =========================================================
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(uiAccent.x * 0.12f, uiAccent.y * 0.32f, uiAccent.z * 0.42f, 0.8f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(uiAccent.x * 0.18f, uiAccent.y * 0.52f, uiAccent.z * 0.62f, 1.0f));
+                    if (ImGui::Button("OPEN DATA ANALYZER", { -1, 28 * scale })) {
+                        g_analyzerState.isOpen = true; // 发射打开分析窗口信号
+                    }
+                    ImGui::PopStyleColor(2);
                     ImGui::EndTabItem();
                 }
 
@@ -2084,16 +2393,13 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                 // =============================================================================
                 // 3. 【新重构的 TabItem】：Model & Preset (模型底图、预设场景与外部导入) [1.2.7]
                 // =============================================================================
-                if (ImGui::BeginTabItem("Model")) {
+                if (ImGui::BeginTabItem("Model_INPUT")) {
                     ImGui::Spacing();
 
                     // -------------------------------------------------------------
                     // A. 岩石物理属性基本耦合 (Density Slide)
                     // -------------------------------------------------------------
                     ImGui::TextColored(uiAccent, "Rock Physics Coupling");
-                    static float edit_Vp = 2000.0f;
-                    static float edit_Vs = 1400.0f;
-                    static float edit_Density = 2000.0f;
 
                     ImGui::SliderFloat("P-Wave Velocity (Vp)", &edit_Vp, 500.0f, 6000.0f, "%.1f m/s");
                     ImGui::SliderFloat("S-Wave Velocity (Vs)", &edit_Vs, 200.0f, 3500.0f, "%.1f m/s");
@@ -2123,18 +2429,17 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                     ImGui::TextColored(uiAccent, "GEOPHYSICAL SCENARIO PRESETS");
 
                     const char* scene_names[] = {
-                        "Uniform Medium (默认均匀地层)",
-                        "Earth Shell & Core (地球核幔分层)",
-                        "Double Slit Interference (双缝挡板干涉)",
-                        "3-Layered Crust (三层水平沉积岩)",
-                        "2-Layered Medium (双层高速低速分界面)",
-                        "Straight Waveguide (直条状低速波导通道)",
-                        "Curved Waveguide (正弦曲线弯曲波导)",
-                        "Phononic Crystal Hex (六角钢球声子晶体)",
-                        "Random Scattering (300个随机气泡强散射)",
-                        "Sinusoidal Interface (正弦起伏分层地质)",
-                        "Linear Velocity Gradient (连续线性速度梯度)",
-                        "Penrose Room (彭罗斯椭圆房间聚焦反射)"
+                        "Uniform Medium",            // 默认均匀地层 (0)
+                        "Earth Shell & Core",        // 地球核幔分层 (1)
+                        "Double Slit Interference",  // 双缝挡板干涉 (2)
+                        "2-Layered Medium",          // 双层高速低速分界面 (3)
+                        "Straight Waveguide",        // 直条状低速波导通道 (4)
+                        "Curved Waveguide",          // 正弦曲线弯曲波导 (5)
+                        "Phononic Crystal Hex",      // 六角钢球声子晶体 (6)
+                        "Random Scattering",         // 300个随机气泡强散射 (7)
+                        "Sinusoidal Interface",      // 正弦起伏分层地质 (8)
+                        "Linear Velocity Gradient",  // 连续线性速度梯度 (9)
+                        "Penrose Room"               // 彭罗斯椭圆房间聚焦反射 (10)
                     };
 
                     static int selected_scene = current_scene;
@@ -2160,14 +2465,26 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                         cudaGraphicsGLRegisterImage(&gl.cudaSeisRes, gl.seisTex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
 
                         first_align_needed = true; // 视口重置吸附
+                        g_resetSimRequested = true; // 发射重置信号并重新上传
                     }
                     ImGui::Spacing();
-
-                    // -------------------------------------------------------------
-                    // C. 外部文本模型导入 (带有用户自主控制垂直翻转开关)
+// -------------------------------------------------------------
+                    // C. 外部文本模型导入 (双列 Browse 浏览与一键安全加载) [1.2.7]
                     // -------------------------------------------------------------
                     ImGui::Separator();
                     ImGui::TextColored(uiAccent, "EXTERNAL MODEL IMPORT (TXT)");
+
+                    static char txt_file_path[512] = ""; // 静态 TXT 模型文件路径缓冲区 [3]
+
+                    // 1. 绘制路径输入框与右侧浏览按钮 (Symmetrical Layout)
+                    ImGui::InputText("TXT File", txt_file_path, IM_ARRAYSIZE(txt_file_path));
+                    ImGui::SameLine();
+                    if (ImGui::Button("Browse##Txt", ImVec2(65 * scale, 0))) {
+                        char filePath[512] = { 0 };
+                        if (OpenSystemFileDialog(filePath, sizeof(filePath))) {
+                            strcpy_s(txt_file_path, filePath); // 复制路径到文本框缓冲区
+                        }
+                    }
 
                     // 用户选择的 Y 轴翻转静态状态变量
                     static bool flipImportY = false;
@@ -2177,22 +2494,32 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                     }
 
                     ImGui::Spacing();
+
+                    // 2. 独立的加载按钮，点击后开始物理重整与显存拷贝
                     if (ImGui::Button("LOAD CUSTOM MODEL FILE", { -1, 35 * scale })) {
-                        char filePath[1024] = { 0 };
-                        if (OpenSystemFileDialog(filePath, sizeof(filePath))) {
+                        // 安全防空检查：确保用户已经通过 Browse 选择了有效路径
+                        if (strlen(txt_file_path) > 0) {
                             // 调用我们重构后的 LoadModelFromTxt，传入用户勾选的 flipImportY 开关、gl 和 state！
-                            if (LoadModelFromTxt(filePath, flipImportY, gl, state)) {
+                            if (LoadModelFromTxt(txt_file_path, flipImportY, gl, state)) {
                                 popup_message = "External model loaded successfully!";
                                 show_success_popup = true;
+                                g_resetSimRequested = true; // 发射重置信号并重新上传
                             }
                             else {
                                 popup_message = "Failed to load model file.\nPlease check file formatting or dimensions.";
                                 show_error_popup = true;
                             }
+
+                            // 自动切换为 1: 科学地质图背景，并隐藏网格，获得最完美的加载视觉
+                            modelStyle = 1;
+                            showGrid = false;
                         }
-                        modelStyle = 1;
-                        showGrid = false;
+                        else {
+                            popup_message = "Error: Please select a TXT model file first!";
+                            show_error_popup = true;
+                        }
                     }
+                    ImGui::Spacing();
                     // =============================================================================
                     // C. 外部标准的 SEG-Y 弹性模型组合导入控制台 [1.2.7]
                     // =============================================================================
@@ -2233,7 +2560,11 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                             strcpy_s(rho_file_path, filePath);
                         }
                     }
-
+                    // 【核心新增】：原 SEG-Y 文件道间距 (X 采样间隔) 调节滑块 [3]
+                    ImGui::SliderFloat("Original SEGY Spacing (dx)", &edit_segy_dx, 0.01f, 50.0f, "%.3f m");
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("The original spatial spacing (trace/sample interval) of your loaded SGY files.\nExample: 0.1m for 30m core samples, 12.5m for standard Marmousi.");
+                    }
                     // 垂直翻转开关
                     static bool flipSegyY = true;
                     static bool flipSegyX = false; // <-- 新增：导入水平翻转复选框
@@ -2249,6 +2580,7 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                             if (LoadModelFromSegy(vp_file_path, vs_file_path, rho_file_path, flipSegyY, flipSegyX, gl, state)) {
                                 popup_message = "SEGY Model Group loaded successfully!";
                                 show_success_popup = true;
+                                g_resetSimRequested = true; // 发射重置信号并重新上传
                             }
                             else {
                                 popup_message = "Failed to load SEGY files.\nPlease check file formatting or grid dimensions.";
@@ -2263,18 +2595,62 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                         showGrid = false;
                     }
                     ImGui::Spacing();
+                    ImGui::PopStyleColor(2);
+                    ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem("Model_EXPORT")) {
+                    
                     // =============================================================================
-                    // D. 导出当前场景中的非均匀地层模型为标准的 SEG-Y 文件群 [1.2.7]
+                    // D. 导出当前场景中的非均匀地层模型为标准的 SEG-Y 文件群 (支持空间高精度裁剪) [1.2.7]
                     // =============================================================================
                     ImGui::Separator();
                     ImGui::TextColored(uiAccent, "EXPORT CURRENT MODEL TO SEG-Y GROUP");
 
-                    static bool export_density_gcm3 = true; // 默认以 g/cm3 格式导出密度
-                    static bool export_flip_x = false;     // <-- 新增：导出水平翻转复选框
+                    static bool export_density_gcm3 = true;
+                    static bool export_flip_x = false;
+
+                    // 裁剪区域控制的静态局部变量
+                    static int crop_x_min = 0;
+                    static int crop_z_min = 0;
+                    static int crop_x_max = 0;
+                    static int crop_z_max = 0;
+
+                    // 【自适应对齐】：当网格尺寸发生变化或首次启动时，默认选择全网格范围导出
+                    if (crop_x_max <= 0 || crop_x_max >= ctx.NX || first_align_needed) {
+                        crop_x_min = 0;
+                        crop_z_min = 0;
+                        crop_x_max = ctx.NX - 1;
+                        crop_z_max = ctx.NZ - 1;
+                    }
+
                     ImGui::Checkbox("Convert Density to g/cm3 on Export", &export_density_gcm3);
                     ImGui::Checkbox("Flip Horizontally on Export", &export_flip_x);
-                    if (ImGui::IsItemHovered()) {
-                        ImGui::SetTooltip("Check to convert Rho from kg/m3 (e.g. 2200) to g/cm3 (e.g. 2.2) on export.");
+
+                    // 空间局部裁剪输入滑条 [1.2.7]
+                    ImGui::TextDisabled("Crop Sub-Region Coordinates (Grid Units):");
+                    ImGui::SliderInt("X Min (Left)", &crop_x_min, 0, ctx.NX - 1);
+                    ImGui::SliderInt("X Max (Right)", &crop_x_max, 0, ctx.NX - 1);
+                    ImGui::SliderInt("Z Min (Top)", &crop_z_min, 0, ctx.NZ - 1);
+                    ImGui::SliderInt("Z Max (Bottom)", &crop_z_max, 0, ctx.NZ - 1);
+
+                    // 一键对齐便捷按钮设计 [1.2.7]
+                    float sub_btn_w = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2.0f;
+
+                    if (ImGui::Button("SET TO FULL GRID", ImVec2(sub_btn_w, 0))) {
+                        crop_x_min = 0;
+                        crop_z_min = 0;
+                        crop_x_max = ctx.NX - 1;
+                        crop_z_max = ctx.NZ - 1;
+                    }
+                    ImGui::SameLine();
+
+                    if (ImGui::Button("STRIP PML BOUNDARY", ImVec2(sub_btn_w, 0))) {
+                        // 一键剥离外侧的 PML 阻尼带，仅将最核心、最纯净的中央地质体导出！ [1.2.7]
+                        crop_x_min = ctx.npml;
+                        crop_z_min = ctx.npml;
+                        crop_x_max = ctx.NX - ctx.npml - 1;
+                        crop_z_max = ctx.NZ - ctx.npml - 1;
                     }
 
                     ImGui::Spacing();
@@ -2285,9 +2661,9 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                     if (ImGui::Button("EXPORT SEG-Y GROUP", { -1, 35 * scale })) {
                         char savePath[512] = { 0 };
                         if (SaveSystemFileDialog(savePath, sizeof(savePath))) {
-                            // 调用导出驱动
-                            if (ExportModelToSegy(savePath, export_density_gcm3, export_flip_x)) {
-                                popup_message = "SEGY Model Group exported successfully!";
+                            // 核心调用：执行裁剪导出
+                            if (ExportModelToSegy(savePath, export_density_gcm3, export_flip_x, crop_x_min, crop_z_min, crop_x_max, crop_z_max)) {
+                                popup_message = "Cropped SEGY Model Group exported successfully!\nCheck out your saved _vp, _vs, _rho files.";
                                 show_success_popup = true;
                             }
                             else {
@@ -2296,8 +2672,6 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                             }
                         }
                     }
-                    ImGui::PopStyleColor(2);
- 
                     ImGui::Spacing();
                     ImGui::PopStyleColor(2);
                     ImGui::EndTabItem();
@@ -2335,41 +2709,6 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
             }
 
             
-            //ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 240 * scale);
-            ImGui::Separator();
-            ImGui::TextColored(uiAccent, "EXECUTION CONTROLS");
-
-            if (state.running) {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.6f, 0.1f, 0.85f));
-                if (ImGui::Button("PAUSE SIMULATION", { -1, 30 * scale })) {
-                    state.running = false;
-                }
-                ImGui::PopStyleColor();
-            }
-            else {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.65f, 0.3f, 0.85f));
-                if (ImGui::Button("RUN SIMULATION", { -1, 30 * scale })) {
-                    state.running = true;
-                }
-                ImGui::PopStyleColor();
-            }
-
-            if (ImGui::Button("RESET SIMULATION", { -1, 28 * scale })) {
-                g_resetSimRequested = true;
-            }
-
-            if (ImGui::Button("RESET VIEWPORT", { -1, 28 * scale })) {
-                g_resetViewportRequested = true;
-            }
-            // =========================================================
-            // 【新增】：一键唤醒/打开 SEG-Y 地震数据分析仪按钮 [1.2.7]
-            // =========================================================
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(uiAccent.x * 0.12f, uiAccent.y * 0.32f, uiAccent.z * 0.42f, 0.8f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(uiAccent.x * 0.18f, uiAccent.y * 0.52f, uiAccent.z * 0.62f, 1.0f));
-            if (ImGui::Button("OPEN DATA ANALYZER", { -1, 28 * scale })) {
-                g_analyzerState.isOpen = true; // 发射打开分析窗口信号
-            }
-            ImGui::PopStyleColor(2);
             ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 55 * scale);
             float avail_w = ImGui::GetContentRegionAvail().x;
             float reset_btn_w = 60.0f * scale;
@@ -2400,7 +2739,178 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
     // 【核心新增】：在 HUD 渲染的最末端，挂载数据分析器主窗口
     //  使其完美享受 g_analyzerState 全局共享信号控制，无需修改 main.cpp！
     // =============================================================================
+
+    // =============================================================================
+    // 【 独立监测视窗 】：Simulation & PML Monitor (由主控制台 show_par 开关控制)
+    //  功能：只读展示物理场活性参数与 1D 阻尼曲线对齐情况，防高度堆叠，支持独立拖拽
+    // =============================================================================
+    if (show_Monitor_par) {
+        ImGui::SetNextWindowPos(ImVec2(30 * scale, 80 * scale), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(420 * scale, 520 * scale), ImGuiCond_FirstUseEver); // 优化高度为 520，更紧凑
+
+        // 绑定主题色到窗口边框
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.08f, 0.1f, 0.85f));   // 深色钛金背景
+        ImGui::PushStyleColor(ImGuiCol_Border, uiAccent);                             // 荧光主题色边框
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.5f);
+
+        // 统一注入主题色到折叠栏标头
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, uiAccent);
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(uiAccent.x * 0.8f, uiAccent.y * 0.8f, uiAccent.z * 0.8f, 0.8f));
+
+        if (ImGui::Begin("Simulation & PML Monitor", &show_Monitor_par)) {
+            // A. 顶部只读 FPS 帧率指示
+            static float displayFPS = 60.0f;
+            displayFPS = displayFPS * 0.95f + io.Framerate * 0.05f;
+            ImGui::TextColored(uiAccent, "MONITOR STATE  |  FPS: %.1f", displayFPS);
+            ImGui::Separator();
+
+            // =============================================================================
+            // 1. 【 实时监控 】：当前运行期参数只读监视器 (ACTIVE PARAMETERS MONITOR)
+            //  功能：将用户前台“草稿参数”与显卡底层“真实计算参数”分流
+            //  提示：如果不一致，智能触发 6Hz 偏色呼吸闪烁警告 [1.2.7]
+            // =============================================================================
+            ImGui::Spacing();
+            if (ImGui::CollapsingHeader("ACTIVE PARAMETERS MONITOR", ImGuiTreeNodeFlags_DefaultOpen)) {
+
+                // 1. 计算高对比度的呼吸警告色 (闪烁频率 6Hz，平滑正弦插值)
+                float time = (float)ImGui::GetTime();
+                float alpha = 0.35f + 0.65f * (sinf(time * 6.0f) * 0.5f + 0.5f);
+                ImVec4 warningCol = ImVec4(1.0f, 0.82f, 0.0f, alpha); // 琥珀荧光黄 [Apply Pending] [1.2.7]
+
+                // 2. 标定当前物理网格规模 (只读)
+                ImGui::TextDisabled("Grid Dimensions:"); ImGui::SameLine();
+                ImGui::Text("%d x %d (Total: %d)", ctx.NX, ctx.NZ, ctx.total_grid);
+
+                // 标定物理几何尺度 (长 x 深)
+                ImGui::TextDisabled("Physical Scale:"); ImGui::SameLine();
+                ImGui::Text("%.1f m x %.1f m", ctx.NX * ctx.h, ctx.NZ * ctx.h);
+
+                // 标定显卡显存分配估计值 (只读)
+                ImGui::TextDisabled("Est. GPU Memory:"); ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.8f, 1.0f), "%.2f MB", cached_vram_mb);
+
+                // 3. 监控空间网格间距 (dx) 状态与对齐检查 [6]
+                ImGui::TextDisabled("Active Spacing (dx):"); ImGui::SameLine();
+                ImGui::Text("%.1f m", ctx.h);
+                if (std::abs(temp_dx - ctx.h) > 1e-4f) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(warningCol, "[Apply Pending]");
+                }
+
+                // 4. 监控时间步长 (dt) 状态与对齐检查 [6]
+                ImGui::TextDisabled("Active Time Step (dt):"); ImGui::SameLine();
+                ImGui::Text("%.6f s", ctx.dt);
+                if (std::abs(temp_dt - ctx.dt) > 1e-7f) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(warningCol, "[Apply Pending]");
+                }
+
+                // 5. 监控最大仿真步数 (nt) 状态与对齐检查
+                ImGui::TextDisabled("Active Max Steps (nt):"); ImGui::SameLine();
+                ImGui::Text("%d steps (%.2f s simulated)", ctx.nt, ctx.nt * ctx.dt);
+                if (temp_nt != ctx.nt) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(warningCol, "[Apply Pending]");
+                }
+
+                // 6. 监控 PML 边界宽度状态与对齐检查
+                ImGui::TextDisabled("Active PML Width:"); ImGui::SameLine();
+                ImGui::Text("%d px", ctx.npml);
+                if (temp_pml != ctx.npml) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(warningCol, "[Apply Pending]");
+                }
+
+                // 7. 监控物理震源网格坐标状态与对齐检查 [1.1.3]
+                int active_src_x = ctx.src_idx % ctx.NX;
+                int active_src_z = ctx.src_idx / ctx.NX;
+                ImGui::TextDisabled("Active Source Pos:"); ImGui::SameLine();
+                ImGui::Text("(%d, %d)", active_src_x, active_src_z);
+                if (edit_src_x != active_src_x || edit_src_z != active_src_z) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(warningCol, "[Apply Pending]");
+                }
+
+                // =============================================================================
+                // 【学术级新增】：动态物性极值指标监控面板 (ACTIVE GEOPHYSICAL METRICS) [3]
+                // =============================================================================
+                ImGui::Separator();
+                ImGui::TextColored(uiAccent, "ACTIVE GEOPHYSICAL METRICS");
+
+                // 纵波速度极值范围
+                ImGui::TextDisabled("P-Wave Velocity (Vp):"); ImGui::SameLine();
+                ImGui::Text("%.1f m/s ~ %.1f m/s", cached_min_vp, cached_max_vp);
+
+                // 横波速度极值范围
+                ImGui::TextDisabled("S-Wave Velocity (Vs):"); ImGui::SameLine();
+                ImGui::Text("%.1f m/s ~ %.1f m/s", cached_min_vs, cached_max_vs);
+
+                // 密度极值范围
+                ImGui::TextDisabled("Density Range (Rho):"); ImGui::SameLine();
+                ImGui::Text("%.1f ~ %.1f kg/m^3", cached_min_rho, cached_max_rho);
+            }
+
+            // =============================================================================
+            // 2. 【 PML 阻尼曲线与层宽度匹配诊断器 (PML Damping Profile Monitor) 】
+            //  利用 ImPlot 实时绘制 1D 阻尼剖面，并绘制垂直荧光边界虚线
+            // =============================================================================
+            ImGui::Spacing();
+            ImGui::TextDisabled("PML Damping Profile (dx) Real-Time Monitor:");
+
+            // 1. 在 CPU 侧生成临时 X 轴网格索引坐标 (0 到 NX)
+            std::vector<float> pml_x_axis(ctx.NX);
+            for (int j = 0; j < ctx.NX; ++j) {
+                pml_x_axis[j] = (float)j;
+            }
+
+            // 2. 局部修改图表配色：纯黑高对比底色 + 荧光绿阻尼线 + 琥珀橘边界线 [1.2.7]
+            ImPlot::PushStyleColor(ImPlotCol_FrameBg, IM_COL32(10, 12, 15, 255)); // 边界框 (深钛金灰)
+            ImPlot::PushStyleColor(ImPlotCol_PlotBg, IM_COL32(0, 0, 0, 255));     // 绘图底色 (纯黑)
+            ImPlot::PushStyleColor(ImPlotCol_Line, IM_COL32(0, 255, 120, 255));   // 曲线颜色 (荧光绿)
+            ImPlot::PushStyleColor(ImPlotCol_AxisGrid, IM_COL32(35, 35, 35, 120)); // 暗灰网格线
+
+            // 传入 ImPlotFlags_NoLegend 隐藏多余标签，使诊断图更加高雅
+            if (ImPlot::BeginPlot("##PmlProfilePlot", ImVec2(-1, 140 * scale), ImPlotFlags_NoLegend)) {
+                ImPlot::SetupAxes("Grid Node Index", "Damping (Hz)", ImPlotAxisFlags_NoTickLabels, 0);
+
+                // 动态获取当前最大阻尼作为 Y 轴上限 (预留 10% 顶空，防止曲线贴顶)
+                float max_d = 1.0f;
+                for (float val : ctx.dx) {
+                    if (val > max_d) max_d = val;
+                }
+                ImPlot::SetupAxesLimits(0.0f, ctx.NX, -max_d * 0.05f, max_d * 1.1f);
+
+                // 绘制阻尼线
+                ImPlot::PlotLine("Damping dx", pml_x_axis.data(), ctx.dx.data(), ctx.NX);
+
+                // 核心安全优化：使用底层像素换算，直接绘制两条垂直荧光橘色边界虚线，规避任何 ImPlot 版本冲突 [1.2.7]
+                double pml_left_boundary = ctx.npml;
+                double pml_right_boundary = ctx.NX - ctx.npml;
+
+                ImVec2 left_p1 = ImPlot::PlotToPixels(ImPlotPoint(pml_left_boundary, -max_d * 0.05f));
+                ImVec2 left_p2 = ImPlot::PlotToPixels(ImPlotPoint(pml_left_boundary, max_d * 1.1f));
+                ImVec2 right_p1 = ImPlot::PlotToPixels(ImPlotPoint(pml_right_boundary, -max_d * 0.05f));
+                ImVec2 right_p2 = ImPlot::PlotToPixels(ImPlotPoint(pml_right_boundary, max_d * 1.1f));
+
+                ImPlot::GetPlotDrawList()->AddLine(left_p1, left_p2, IM_COL32(255, 140, 0, 180), 1.5f);
+                ImPlot::GetPlotDrawList()->AddLine(right_p1, right_p2, IM_COL32(255, 140, 0, 180), 1.5f);
+
+                ImPlot::EndPlot();
+            }
+            ImPlot::PopStyleColor(4); // 弹出 4 个局部颜色
+            ImGui::Spacing();
+        }
+        ImGui::End();
+
+        // 统一弹出样式，避免状态污染
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor(4); // 弹出 WindowBg, Border, HeaderActive, HeaderHovered
+    }
+
     RenderAnalysisWindow(g_analyzerState);
+
+
     // =============================================================================
     // 【 9. 新增：底部专业状态监控栏 (BottomBar) 】
     // =============================================================================
@@ -2488,4 +2998,3 @@ inline void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandl
 
     RenderSeisHUD(state, winW, winH, barHeight, scale, gl, info);
 }
-//这是你之前给我的完整代码，已经非常完美了。现在请结合之前那个“不需要引入模拟中心，上面为地表”的片段着色器，进行完整的代码编译。检查是否有没写完或缺失定义的地方。

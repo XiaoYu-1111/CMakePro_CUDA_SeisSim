@@ -270,21 +270,41 @@ void main() {
         finalColor = mix(finalColor, vec3(0.0, 1.0, 1.0), gridDot * opacityDot);   
     }   
 
+
     // =============================================================================
-    // 8. 绘制 PML 吸收边界荧光线
+    // 8. 绘制 PML 吸收边界荧光线 (完全对齐 Section 9 极简 1D 坐标检测算法，彻底消除缩放闪烁)
     // =============================================================================
     if (npml > 0.0) {
-        vec2 boxCenter = simSize * 0.5;
-        vec2 halfExtents = (simSize * 0.5) - vec2(npml);
-        float distToPml = abs(sdBox(cellPos - boxCenter, halfExtents));
+        // A. 建立四个方向纯一维正交物理坐标的绝对距离 [3]
+        float dPmlLeft   = abs(cellPos.x - npml);
+        float dPmlRight  = abs(cellPos.x - (simSize.x - npml));
+        float dPmlBottom = abs(cellPos.y - (simSize.y - npml));
+        float dPmlTop    = abs(cellPos.y - npml);
 
+        float distToPml = 1e6;
+    
+        // B. 在水平有效范围内（左边界到右边界之间），判定上下边界线的距离
+        // 增加 0.1 容差，确保水平线与垂直线在角落完美闭合、无微小黑点缺口
+        if (cellPos.x >= (npml - 0.1) && cellPos.x <= simSize.x - (npml - 0.1)) {
+            distToPml = min(distToPml, dPmlBottom);
+            distToPml = min(distToPml, dPmlTop);
+        }
+    
+        // C. 在垂直有效范围内（上边界到下边界之间），判定左右边界线的距离
+        if (cellPos.y >= (npml - 0.1) && cellPos.y <= simSize.y - (npml - 0.1)) {
+            distToPml = min(distToPml, dPmlLeft);
+            distToPml = min(distToPml, dPmlRight);
+        }
+
+        // D. 像素级抗锯齿宽度计算 (由于采用一维线性导数，宽幅在缩放时稳定常驻)
         float pmlLineThickness = 1.5; 
         float pmlAA = fwidth(distToPml);
         float pmlBorder = smoothstep(pmlAA * pmlLineThickness, 0.0, distToPml - 0.05);
-        
+    
+        // 保持您代码中的荧光色调 [1.2.7]
         vec3 pmlLineColor = vec3(0.5, 1.0, 0.5); 
         float topFade = smoothstep(0.0, npml + 2.0, cellPos.y);
-        
+    
         finalColor = mix(finalColor, pmlLineColor, pmlBorder * 0.65 * topFade);
     }
 
