@@ -93,8 +93,7 @@ inline ImVec4 uiAccent = ImVec4(0.5f, 1.0f, 0.5f, 1.0f);
 
 inline bool is_mouse_inside = false;
 
-
-inline int current_scene = SCENE_UNIFORM; // 当前加载的物理场景
+inline int current_scene = SCENE_TWO_LAYER; // 当前加载的物理场景
 
 // --- 共享物性参数 ---
 inline float edit_Vp = 2000.0f; // 全局共享：纵波速度
@@ -122,6 +121,107 @@ inline float cached_vram_mb = 0.0f; // 估算显存占用
 
 inline float edit_segy_dx = 1.0f; // 外部导入 SEG-Y 时实际物理道间距 (米)
 
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
+// =============================================================================
+// 【安全硬件监控】：C 兼容的 NVML 结构体与类型定义 (避免引入第三方 .h 产生编译冲突)
+// =============================================================================
+typedef int nvmlReturn_t;
+#define NVML_SUCCESS 0
+#define NVML_TEMPERATURE_GPU 0
+
+typedef struct {
+    unsigned int gpu;
+    unsigned int memory;
+} nvmlUtilization_t;
+
+typedef void* nvmlDevice_t;
+
+// 函数指针类型定义
+typedef nvmlReturn_t(*pfn_nvmlInit)();
+typedef nvmlReturn_t(*pfn_nvmlShutdown)();
+typedef nvmlReturn_t(*pfn_nvmlDeviceGetHandleByIndex)(unsigned int, nvmlDevice_t*);
+typedef nvmlReturn_t(*pfn_nvmlDeviceGetUtilizationRates)(nvmlDevice_t, nvmlUtilization_t*);
+typedef nvmlReturn_t(*pfn_nvmlDeviceGetTemperature)(nvmlDevice_t, int, unsigned int*);
+typedef nvmlReturn_t(*pfn_nvmlDeviceGetPowerUsage)(nvmlDevice_t, unsigned int*);
+
+// =============================================================================
+// 【安全硬件监控】：动态运行期 NVML 连接器 (Symmetric GPU Loader)
+// =============================================================================
+struct DynamicNVML {
+    bool loaded = false;
+#ifdef _WIN32
+    HMODULE handle = nullptr;
+#else
+    void* handle = nullptr;
+#endif
+
+    pfn_nvmlInit                     init = nullptr;
+    pfn_nvmlShutdown                 shutdown = nullptr;
+    pfn_nvmlDeviceGetHandleByIndex   getHandle = nullptr;
+    pfn_nvmlDeviceGetUtilizationRates getUtil = nullptr;
+    pfn_nvmlDeviceGetTemperature     getTemp = nullptr;
+    pfn_nvmlDeviceGetPowerUsage      getPower = nullptr;
+
+    nvmlDevice_t devHandle = nullptr;
+
+    // 动态载入系统层 NVIDIA 管理驱动
+    void Load() {
+        if (loaded) return;
+#ifdef _WIN32
+        handle = LoadLibraryA("nvml.dll"); // Windows 驱动目录下自带
+#else
+        handle = dlopen("libnvidia-ml.so", RTLD_LAZY); // Linux 系统库
+#endif
+        if (!handle) return;
+
+#ifdef _WIN32
+        init = (pfn_nvmlInit)GetProcAddress(handle, "nvmlInit");
+        shutdown = (pfn_nvmlShutdown)GetProcAddress(handle, "nvmlShutdown");
+        getHandle = (pfn_nvmlDeviceGetHandleByIndex)GetProcAddress(handle, "nvmlDeviceGetHandleByIndex");
+        getUtil = (pfn_nvmlDeviceGetUtilizationRates)GetProcAddress(handle, "nvmlDeviceGetUtilizationRates");
+        getTemp = (pfn_nvmlDeviceGetTemperature)GetProcAddress(handle, "nvmlDeviceGetTemperature");
+        getPower = (pfn_nvmlDeviceGetPowerUsage)GetProcAddress(handle, "nvmlDeviceGetPowerUsage");
+#else
+        init = (pfn_nvmlInit)dlsym(handle, "nvmlInit");
+        shutdown = (pfn_nvmlShutdown)dlsym(handle, "nvmlShutdown");
+        getHandle = (pfn_nvmlDeviceGetHandleByIndex)dlsym(handle, "nvmlDeviceGetHandleByIndex");
+        getUtil = (pfn_nvmlDeviceGetUtilizationRates)dlsym(handle, "nvmlDeviceGetUtilizationRates");
+        getTemp = (pfn_nvmlDeviceGetTemperature)dlsym(handle, "nvmlDeviceGetTemperature");
+        getPower = (pfn_nvmlDeviceGetPowerUsage)dlsym(handle, "nvmlDeviceGetPowerUsage");
+#endif
+
+        if (init && shutdown && getHandle && getUtil && getTemp && getPower) {
+            if (init() == NVML_SUCCESS) {
+                if (getHandle(0, &devHandle) == NVML_SUCCESS) {
+                    loaded = true;
+                }
+                else {
+                    shutdown();
+                }
+            }
+        }
+    }
+
+    void Unload() {
+        if (!loaded) return;
+        if (shutdown) shutdown();
+#ifdef _WIN32
+        FreeLibrary(handle);
+#else
+        dlclose(handle);
+#endif
+        loaded = false;
+    }
+};
+
+// 全局唯一的动态硬件监控器实例
+inline DynamicNVML g_nvml;
 
 // =============================================================================
 // 3. 核心计算状态与极值估算缓存重算
@@ -273,27 +373,55 @@ inline void RenderBrushCursor(const SimState& state, const ViewportInfo& vp) {
             const float crosshairSize = 18.0f;
             const float outerRingRadius = 35.0f;
 
-            ImU32 col_main = IM_COL32(102, 191, 217, 255);   // 科技青
-            ImU32 col_dynamic = IM_COL32(255, 230, 51, 255);    // 荧光黄
-            ImU32 col_shadow = IM_COL32(13, 20, 56, 150);
+            // -----------------------------------------------------------------
+            // 【自适应色彩系统】：解构全局 uiAccent 主题色进行高拟真重映射
+            // -----------------------------------------------------------------
+            float r = uiAccent.x;
+            float g = uiAccent.y;
+            float b = uiAccent.z;
 
+            // 主色调：与前台主题 UI 100% 物理对齐
+            ImU32 col_main = IM_COL32(r * 255, g * 255, b * 255, 255);
+
+            // 动态扫描指针色：在主题色基础上进行高亮推高，形成耀眼的发光点
+            ImU32 col_dynamic = IM_COL32(
+                (int)std::min(255.0f, r * 1.15f * 255.0f),
+                (int)std::min(255.0f, g * 1.15f * 255.0f),
+                (int)std::min(255.0f, b * 1.15f * 255.0f),
+                255
+            );
+
+            // 投影阴影：修改为更协调的深黑/暗绿暗角，使绿光边缘对比更柔和
+            ImU32 col_shadow = IM_COL32(10, 18, 12, 160);
+
+            // -----------------------------------------------------------------
+            // 图层绘制逻辑 (保持原有高性能几何结构)
+            // -----------------------------------------------------------------
+            // 1. 底层高对比投影十字线
             fg->AddLine(ImVec2(mousePos.x - crosshairSize, mousePos.y), ImVec2(mousePos.x + crosshairSize, mousePos.y), col_shadow, 4.0f);
             fg->AddLine(ImVec2(mousePos.x, mousePos.y - crosshairSize), ImVec2(mousePos.x, mousePos.y + crosshairSize), col_shadow, 4.0f);
+
+            // 2. 顶层主题色十字准星
             fg->AddLine(ImVec2(mousePos.x - crosshairSize, mousePos.y), ImVec2(mousePos.x + crosshairSize, mousePos.y), col_main, 2.0f);
             fg->AddLine(ImVec2(mousePos.x, mousePos.y - crosshairSize), ImVec2(mousePos.x, mousePos.y + crosshairSize), col_main, 2.0f);
 
+            // 3. 科技准星外包圆环
             fg->AddCircle(mousePos, outerRingRadius, col_main, 32, 1.5f);
 
+            // 4. 雷达旋转扫描扫描针
             float  angle = t * 4.0f;
             ImVec2 scanEnd = ImVec2(mousePos.x + cos(angle) * outerRingRadius,
                 mousePos.y + sin(angle) * outerRingRadius);
             fg->AddLine(mousePos, scanEnd, col_dynamic, 2.0f);
             fg->AddCircleFilled(scanEnd, 3.5f, col_dynamic);
 
+            // 5. 阻尼正弦收缩脉冲波
             float pulse_t = fmodf(t, 1.5f) / 1.5f;
             float pulse_radius = pulse_t * outerRingRadius;
             int   pulse_alpha = (int)(sin(pulse_t * 3.14159f) * 120);
-            ImU32 col_pulse = IM_COL32(255, 230, 51, pulse_alpha);
+
+            // 脉冲波颜色同步使用带透明度的主题色
+            ImU32 col_pulse = IM_COL32(r * 255, g * 255, b * 255, pulse_alpha);
             fg->AddCircle(mousePos, pulse_radius, col_pulse, 32, 3.0f);
         }
         else {
@@ -376,6 +504,72 @@ inline void RenderSourceMarker(
         fg->AddCircle(pos, 5.0f + pulse, IM_COL32(125, 255, 125, 155), 16, 1.0f);
     }
 }
+// =============================================================================
+// 【新增】：全局悬浮模态弹窗渲染器 (处理加载成功/失败的 UI 弹窗反馈)
+// =============================================================================
+inline void RenderSeisPopups() {
+    // -------------------------------------------------------------------------
+    // A. 成功模态弹窗 (绿框白字)
+    // -------------------------------------------------------------------------
+    if (show_success_popup) {
+        ImGui::OpenPopup("Simulation Success");
+        show_success_popup = false; // 消费单次激发信号，避免重复 Open
+    }
+
+    // 为成功弹窗绑定绿色荧光边框
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.2f, 0.8f, 0.2f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.5f);
+
+    if (ImGui::BeginPopupModal("Simulation Success", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "[ SUCCESS ]");
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // 渲染我们在后台写入的字符串消息
+        ImGui::Text("%s", popup_message.c_str());
+
+        ImGui::Spacing();
+        ImGui::Separator();
+
+        if (ImGui::Button("OK", ImVec2(120, 0))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+
+    // -------------------------------------------------------------------------
+    // B. 失败模态弹窗 (红框白字)
+    // -------------------------------------------------------------------------
+    if (show_error_popup) {
+        ImGui::OpenPopup("Simulation Error");
+        show_error_popup = false; // 消费单次激发信号
+    }
+
+    // 为失败弹窗绑定高警示度红框
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.9f, 0.2f, 0.2f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.5f);
+
+    if (ImGui::BeginPopupModal("Simulation Error", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f), "[ ERROR ]");
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // 渲染后台写入的错误诊断信息
+        ImGui::Text("%s", popup_message.c_str());
+
+        ImGui::Spacing();
+        ImGui::Separator();
+
+        if (ImGui::Button("OK", ImVec2(120, 0))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+}
 
 // 简单的雷克子波产生器
 void generateRickerWavelet(std::vector<float>& wavelet, int nt, float dt, float f0, float t0) {
@@ -390,7 +584,36 @@ void generateRickerWavelet(std::vector<float>& wavelet, int nt, float dt, float 
 
 /// //////////////////////////////////////////第二部分
 // =============================================================================
-// 7. PML 吸收层阻尼衰减系数更新 (黄金 PML 2.5 阶阻尼曲线计算)
+// 【新增】：根据当前地层物理极限，一键自动对齐并锁定到最大安全时间步长 (CFL = 0.480)
+//  每当切换预设、导入 SEG-Y/TXT 自定义模型时，一键调用此函数即可完成物理对齐
+// =============================================================================
+// =============================================================================
+// 【修正后】：一键自动对齐并锁定到最大安全时间步长 (CFL = 0.480)
+// =============================================================================
+inline void AutoAlignTimeStep() {
+    if (ctx.total_grid <= 0) return;
+
+    // 1. 自动提取地层最大纵波速度
+    float max_vp = 0.0f;
+    for (int k = 0; k < ctx.total_grid; ++k) {
+        float vp = sqrtf(ctx.lambda2mu[k] / ctx.rho[k]);
+        if (vp > max_vp) max_vp = vp;
+    }
+    if (max_vp <= 350.0f) max_vp = 2000.0f;
+
+    // 2. 自动锁定在极限安全步长
+    ctx.dt = 0.480f * ctx.h / max_vp;
+    gpu_data.inv_dt = 1.0f / ctx.dt;
+    temp_dt = ctx.dt;
+
+    // =========================================================================
+    // 【核心修复】：必须使用最新、对齐后的时间步长 ctx.dt 重新生成 Ricker 子波！
+    //  否则用旧 dt 生成的子波在新时步下播放会发生严重的频率畸变 (缩放拉伸)
+    // =========================================================================
+    generateRickerWavelet(ctx.wavelet, ctx.nt, ctx.dt, edit_f0, edit_t0);
+}
+// =============================================================================
+// 7. PML 吸收层阻尼衰减系数更新 (专注于差分系数建立，不越权修改系统全局 dt)
 // =============================================================================
 inline void UpdatePmlDampingArrays() {
     float max_vp = 0.0f;
@@ -398,6 +621,7 @@ inline void UpdatePmlDampingArrays() {
         float vp = sqrtf(ctx.lambda2mu[k] / ctx.rho[k]);
         if (vp > max_vp) max_vp = vp;
     }
+    if (max_vp <= 350.0f) max_vp = 2000.0f;
 
     ctx.dx.assign(ctx.NX, 0.0f);
     ctx.dx_half.assign(ctx.NX, 0.0f);
@@ -405,13 +629,10 @@ inline void UpdatePmlDampingArrays() {
     ctx.dz_half.assign(ctx.NZ, 0.0f);
 
     if (ctx.npml > 0) {
-        float L = ctx.npml * ctx.h; // PML 吸收层物理总厚度
-
-        // 采用 3.5 倍的学术级阻尼安全余量，配合 2.5 阶黄金阻尼，彻底根除流固发散
+        float L = ctx.npml * ctx.h;
         float d_max = (3.0f * max_vp * 16.12f * 3.5f) / (2.0f * L);
         float pml_power = 2.5f;
 
-        // X 轴 PML 阻尼系数初始化 (交错网格 0.5 半步长偏移对齐)
         for (int i = 0; i < ctx.npml; ++i) {
             float x_thick = (ctx.npml - i) / (float)ctx.npml;
             float x_thick_half = (ctx.npml - (i + 0.5f)) / (float)ctx.npml;
@@ -426,7 +647,6 @@ inline void UpdatePmlDampingArrays() {
             ctx.dx_half[ctx.NX - 1 - i] = val_half;
         }
 
-        // Z 轴 PML 阻尼系数初始化
         for (int i = 0; i < ctx.npml; ++i) {
             float z_thick = (ctx.npml - i) / (float)ctx.npml;
             float z_thick_half = (ctx.npml - (i + 0.5f)) / (float)ctx.npml;
@@ -863,7 +1083,7 @@ inline void ApplyScenario(int type, SimState& state) {
 
     // 3. 实时重新计算物理极限所匹配的自适应 PML 阻尼系数
     UpdatePmlDampingArrays();
-
+    AutoAlignTimeStep();
     // 4. 重算自由表面 dp_flat 阻抗
     ctx.dp_flat.assign(ctx.NX, 0.0f);
     int fs_idx = ctx.npml;
@@ -1169,6 +1389,7 @@ inline bool LoadModelFromTxt(const std::string& filename, bool flipVertically, G
 
     // 重新计算并标定最高波速下的 PML 阻尼系数
     UpdatePmlDampingArrays();
+    AutoAlignTimeStep();
 
     ctx.dp_flat.assign(ctx.NX, 0.0f);
     int fs_idx = ctx.npml;
@@ -1288,7 +1509,7 @@ inline bool LoadModelFromSegy(
         }
     }
     UpdatePmlDampingArrays();
-
+    AutoAlignTimeStep();
     // 5. 释放并重新注册 FBO 纹理尺寸，防止显存崩溃
     freeGPUSimulation(gpu_data);
     cudaGraphicsUnregisterResource(gl.cudaSeisRes);
@@ -2398,34 +2619,104 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
 
                     ImGui::SliderFloat("Time Step (dt)", &temp_dt, 0.00001f, 0.003f, "%.6f s");
                     ImGui::SliderFloat("Grid Spacing (dx)", &temp_dx, 0.1f, 20.0f, "%.1f m");
-                    ImGui::SliderInt("PML Layer Width", &temp_pml, 10, 100, "%d px"); // PML 宽度实时滑块
+                    // =========================================================================
+                    // 【优化】：开放 PML 宽度下限至 0，实现一键无缝切换至“物理全反射模式”
+                    // =========================================================================
+                    if (temp_pml == 0) {
+                        ImGui::SliderInt("PML Layer Width", &temp_pml, 0, 100, "0 (Total Reflection)");
+                    }
+                    else {
+                        ImGui::SliderInt("PML Layer Width", &temp_pml, 0, 100, "%d px");
+                    }
                     ImGui::SliderInt("Max Steps (nt)", &temp_nt, 500, 50000);
                     ImGui::SliderInt("Steps / Frame", &steps_per_frame, 1, 100);
 
-                    float dt_limit = 0.5f * temp_dx / max_vp;
-                    bool  is_stable = (temp_dt <= dt_limit);
-                    ImGui::Text("Max Allowed dt (CFL Limit): %.6f s", dt_limit);
-                    if (is_stable) ImGui::TextColored({ 0.2f, 1.0f, 0.4f, 1.0f }, "[ STATUS: CFL STABLE ]");
-                    else           ImGui::TextColored({ 1.0f, 0.2f, 0.2f, 1.0f }, "[ STATUS: DIVERGENCE RISK! ]");
+                    // =========================================================================
+                    // 【重构】：双库朗数（CFL）多维物理稳定性分析系统
+                    // =========================================================================
+                    // 1. 理论绝对失稳极限值（CFL 理论库朗数 = 0.601）
+                    float cfl_theory = 0.601f;
+                    float dt_theory_limit = cfl_theory * temp_dx / max_vp;
+
+                    // 2. 实际应用处理后的安全限制（CFL 安全库朗数 = 0.480，留出 20% 余量防 PML 边界发散）
+                    float cfl_safe = 0.480f;
+                    float dt_safe_limit = cfl_safe * temp_dx / max_vp;
+
+                    ImGui::TextDisabled("CFL Stability Analysis:");
+
+                    // 理论极限显示
+                    ImGui::Text("- Theoretical Limit (CFL = %.3f):", cfl_theory); ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%.6f s", dt_theory_limit);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Absolute mathematical threshold.\nGoing above this will cause instant numerical divergence (NaN).");
+                    }
+
+                    // 实际处理后（安全）限制显示
+                    ImGui::Text("- Processed Safe Limit (CFL = %.3f):", cfl_safe); ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.8f, 1.0f), "%.6f s", dt_safe_limit);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Engineering standard threshold with a 20%% safety margin.\nThis coefficient is practically applied to absorb PML boundary stiffness safely.");
+                    }
+
+                    ImGui::Text("- Current Draft Step (dt): %.6f s", temp_dt);
+
+                    // 3. 三色高阶稳定状态监控指示灯
+                    if (temp_dt <= dt_safe_limit) {
+                        // 处于安全区域
+                        ImGui::TextColored({ 0.2f, 1.0f, 0.4f, 1.0f }, "[ STATUS: CFL STABLE (Highly Safe) ]");
+                    }
+                    else if (temp_dt <= dt_theory_limit) {
+                        // 处于临界高风险区域
+                        ImGui::TextColored({ 1.0f, 0.62f, 0.0f, 1.0f }, "[ STATUS: CFL MARGINAL (Risk of PML boundary explosion!) ]");
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::SetTooltip("Warning: The requested dt is mathematically stable for homogeneous grids,\nbut may diverge inside PML damping layers or free surfaces.");
+                        }
+                    }
+                    else {
+                        // 已经越过生死线，必定溢出发散
+                        ImGui::TextColored({ 1.0f, 0.2f, 0.2f, 1.0f }, "[ STATUS: CFL DIVERGENT (Will blow up!) ]");
+                    }
 
                     ImGui::Spacing();
                     if (ImGui::Button("APPLY TIME & SPACING CONTROLS", { -1, 30 * scale })) {
+                        // 1. 提取当前物理最大波速，用于安全边界钳位检测
+                        float max_vp = 0.0f;
+                        for (int k = 0; k < ctx.total_grid; ++k) {
+                            float vp = sqrtf(ctx.lambda2mu[k] / ctx.rho[k]);
+                            if (vp > max_vp) max_vp = vp;
+                        }
+                        if (max_vp <= 350.0f) max_vp = 2000.0f;
+
+                        // 2. 算理论生死限 (CFL = 0.601)
+                        float dt_theory_limit = 0.601f * temp_dx / max_vp;
+
+                        // 3. 【安全保护】：若用户输入的 dt 大于理论极限，强制将其钳位重置为 0.480 的安全值
+                        if (temp_dt > dt_theory_limit) {
+                            temp_dt = 0.480f * temp_dx / max_vp;
+                            popup_message = "Warning: Input dt exceeded CFL stability limit.\nAutomatically clamped to safe value.";
+                            show_error_popup = true;
+                        }
+
+                        // 4. 应用经过安全拦截的步长与空间参数
                         ctx.dt = temp_dt;
+                        gpu_data.inv_dt = 1.0f / ctx.dt;
                         ctx.nt = temp_nt;
                         ctx.h = temp_dx;
+
                         par.model.dx = temp_dx;
                         par.model.dz = temp_dx;
-
                         ctx.npml = temp_pml;
                         par.FDM.npml = (float)temp_pml;
 
+                        // 5. 极简化差分系数更新
                         ctx.c1_h = 1.125022f / temp_dx;
                         ctx.c2_h = -0.04687594f / temp_dx;
                         ctx.c3_h = 0.00416669f / temp_dx;
                         ctx.c4_h = -0.00019234f / temp_dx;
 
-                        // 重算阻尼曲线与自由表面
+                        // 6. 重新执行高能效阻尼剖面重算与自由表面自适应对齐
                         UpdatePmlDampingArrays();
+
                         ctx.dp_flat.assign(ctx.NX, 0.0f);
                         int fs_idx = ctx.npml;
                         for (int j = 0; j < ctx.NX; ++j) {
@@ -2437,9 +2728,11 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                             }
                         }
 
+                        // 7. 重新分管道记录表并重绘震源子波
                         ctx.record_vx.assign(ctx.num_rcv * ctx.nt, 0.0f);
                         ctx.record_vz.assign(ctx.num_rcv * ctx.nt, 0.0f);
                         generateRickerWavelet(ctx.wavelet, ctx.nt, ctx.dt, par.FDM.f0, par.FDM.t0);
+
                         g_resetSimRequested = true;
                     }
                     ImGui::Spacing();
@@ -2667,11 +2960,11 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                         ctx.mu.assign(ctx.total_grid, mu_val);
                         ctx.lambda.assign(ctx.total_grid, lambda_val);
                         ctx.lambda2mu.assign(ctx.total_grid, lambda2mu_val);
-
                         g_resetSimRequested = true;
+                        UpdatePmlDampingArrays();
+                        AutoAlignTimeStep();
                     }
                     ImGui::Spacing();
-
                     ImGui::Separator();
                     ImGui::TextColored(uiAccent, "GEOPHYSICAL SCENARIO PRESETS");
 
@@ -2893,6 +3186,7 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                     ImGui::PopStyleColor(2);
                     ImGui::EndTabItem();
                 }
+
                 // ==========================================
                 // Tab 4: Data Export 数据采集与观测排列布设
                 // ==========================================
@@ -3133,8 +3427,100 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                 ImGui::TextDisabled("Physical Scale:"); ImGui::SameLine();
                 ImGui::Text("%.1f m x %.1f m", ctx.NX * ctx.h, ctx.NZ * ctx.h);
 
-                ImGui::TextDisabled("Est. GPU Memory:"); ImGui::SameLine();
+                // =========================================================================
+                // 【核心修复】：基于 cudaMemGetInfo 的实时物理硬件 VRAM 占用诊断器
+                // =========================================================================
+                size_t free_mem = 0;
+                size_t total_mem = 0;
+                float used_vram_mb = 0.0f;
+                float total_vram_mb = 0.0f;
+
+                // 直接向 CUDA 运行时驱动发起快速硬件查询
+                if (cudaMemGetInfo(&free_mem, &total_mem) == cudaSuccess) {
+                    used_vram_mb = static_cast<float>(total_mem - free_mem) / (1024.0f * 1024.0f);
+                    total_vram_mb = static_cast<float>(total_mem) / (1024.0f * 1024.0f);
+                }
+
+                // 1. 展现系统底层真实的显存整体负载
+                ImGui::TextDisabled("System GPU VRAM:"); ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.8f, 1.0f), "%.1f / %.1f MB", used_vram_mb, total_vram_mb);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("System-wide allocated VRAM on the active GPU (Current Used / Total Capacity).");
+                }
+
+                // 2. 展现当前数值网格（系数场+波动应力场）估算的占用量 (让学者清晰掌握算法开销)
+                ImGui::TextDisabled("Grid VRAM (Est.):"); ImGui::SameLine();
                 ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.8f, 1.0f), "%.2f MB", cached_vram_mb);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Estimated memory allocated strictly for this finite-difference simulation grid.");
+                }
+                // 1. 尝试惰性载入 NVML
+                g_nvml.Load();
+
+                unsigned int gpu_util = 0;
+                unsigned int gpu_temp = 0;
+                unsigned int gpu_power_mw = 0;
+                bool         nvml_ok = false;
+
+                // 2. 如果成功连接，直接向显卡驱动提取实时硬件状态
+                if (g_nvml.loaded) {
+                    nvmlUtilization_t util{};
+                    if (g_nvml.getUtil(g_nvml.devHandle, &util) == NVML_SUCCESS) {
+                        gpu_util = util.gpu;
+                    }
+                    if (g_nvml.getTemp(g_nvml.devHandle, NVML_TEMPERATURE_GPU, &gpu_temp) == NVML_SUCCESS) {
+                        // 成功捕获核心温度
+                    }
+                    if (g_nvml.getPower(g_nvml.devHandle, &gpu_power_mw) == NVML_SUCCESS) {
+                        // 成功捕获实时功耗 (毫瓦)
+                    }
+                    nvml_ok = true;
+                }
+
+                // -------------------------------------------------------------
+                // 3. 展现 GPU Core 实时运行占用率
+                // -------------------------------------------------------------
+                ImGui::TextDisabled("GPU Core Usage:"); ImGui::SameLine();
+                if (nvml_ok) {
+                    ImGui::TextColored(uiAccent, "%u %%", gpu_util);
+                }
+                else {
+                    ImGui::TextDisabled("N/A (NVML Offline)");
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Active SM core utilization rate (same as Task Manager's CUDA chart).");
+                }
+
+                // -------------------------------------------------------------
+                // 4. 展现 GPU 核心实时工作温度
+                // -------------------------------------------------------------
+                ImGui::TextDisabled("GPU Temperature:"); ImGui::SameLine();
+                if (nvml_ok) {
+                    // 温度警告：当核心温度超过 82°C 时，自动变色警示
+                    ImVec4 tempColor = (gpu_temp >= 82) ? ImVec4(1.0f, 0.2f, 0.2f, 1.0f) : uiAccent;
+                    ImGui::TextColored(tempColor, "%u oC", gpu_temp);
+                }
+                else {
+                    ImGui::TextDisabled("N/A (NVML Offline)");
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Real-time GPU core temperature.");
+                }
+
+                // -------------------------------------------------------------
+                // 5. 展现 GPU 实时核级工作功耗
+                // -------------------------------------------------------------
+                ImGui::TextDisabled("GPU Power Draw:"); ImGui::SameLine();
+                if (nvml_ok) {
+                    ImGui::TextColored(uiAccent, "%.1f W", static_cast<float>(gpu_power_mw) / 1000.0f);
+                }
+                else {
+                    ImGui::TextDisabled("N/A (NVML Offline)");
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Real-time GPU board power consumption (Watts).");
+                }
+
 
                 ImGui::TextDisabled("Active Spacing (dx):"); ImGui::SameLine();
                 ImGui::Text("%.1f m", ctx.h);
@@ -3330,4 +3716,8 @@ inline void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandl
 
     // 7. GUI/HUD 覆盖：在最上层绘制刻度物理标尺、科技画笔和 ImGui 交互面板
     RenderSeisHUD(state, winW, winH, barHeight, scale, gl, info);
+    // =========================================================================
+    // 【核心新增】：挂载全局模态弹窗，使其完美浮在所有层级最顶端，恢复弹窗响应
+    // =========================================================================
+    RenderSeisPopups();
 }

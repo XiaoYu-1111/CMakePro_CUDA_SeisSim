@@ -244,19 +244,37 @@ vec3 getGeologicalBackground(vec2 uv, vec2 cellPos) {
         }
     }
 
-    // PML Darkening
-    if (npml > 0.0) {
-        float distToEdge = min(min(cellPos.x, simSize.x - cellPos.x), min(cellPos.y, simSize.y - cellPos.y));
-        if (distToEdge < npml) {
-            float stripe = step(0.5, fract((cellPos.x + cellPos.y) * 0.15));
-            float fade = smoothstep(0.0, npml, npml - distToEdge);
-            if (modelStyle == 4) { // 白背景需要单独处理
-                bgCol = mix(bgCol, vec3(0.82, 0.84, 0.88), fade * (0.35 + 0.10 * stripe));
-            } else {
-                bgCol = mix(bgCol, bgCol * 0.15, fade * (0.25 + 0.15 * stripe));
+// PML Darkening (PML 吸收层浅白斜纹与自适应变暗渲染)
+if (npml > 0.0) {
+    float distToEdge = min(min(cellPos.x, simSize.x - cellPos.x), min(cellPos.y, simSize.y - cellPos.y));
+    if (distToEdge < npml) {
+        // 1. 斜纹周期和密度计算 (0.15 决定密度)
+        float stripe = step(0.5, fract((cellPos.x + cellPos.y) * 0.15));
+        float fade = smoothstep(0.0, npml, npml - distToEdge);
+
+        if (modelStyle == 4) { // 科学白背景下
+            // 白背景下保持经典的淡灰色条纹
+            bgCol = mix(bgCol, vec3(0.75, 0.78, 0.82), fade * (0.50 + 0.25 * stripe));
+        } 
+        else { // 钛金灰/跟随波场等深色背景下
+            // A. 底色平滑变暗：PML 区域越往外边缘走，地质背景底色越暗（确保最边缘深邃）
+            float base_darken = 0.45; // 基础变暗程度 (0.0 ~ 1.0)
+            bgCol = mix(bgCol, bgCol * 0.05, fade * base_darken);
+
+            // B. 【核心新增】：将斜条纹（stripe == 1.0）混合为高雅的浅白色/淡灰色 (Light White)
+            if (stripe > 0.5) {
+                // -------------------------------------------------------------
+                // 您可以通过调节以下两个参数，轻松微调浅白斜条纹的亮度和强弱：
+                // -------------------------------------------------------------
+                vec3  stripe_color = vec3(0.52, 0.54, 0.58); // 浅白条纹基础颜色 (0.52 代表柔和白，值越大越接近纯白)
+                float stripe_alpha = 0.28;                   // 斜条纹基础不透明度 (原为暗色，这里用 0.28 即可呈现极其高雅的淡白荧光感)
+
+                // 随着 fade 从内边缘向最外侧平滑淡入
+                bgCol = mix(bgCol, stripe_color, fade * stripe_alpha);
             }
         }
     }
+}
     return bgCol;
 }
 
