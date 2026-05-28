@@ -120,6 +120,7 @@ inline float cached_min_rho = 0.0f;
 inline float cached_vram_mb = 0.0f; // 估算显存占用
 
 inline float edit_segy_dx = 1.0f; // 外部导入 SEG-Y 时实际物理道间距 (米)
+inline float export_target_dx = 1.0f; // 导出目标网格间距 (米，默认与当前模拟步长对齐)
 
 
 #ifdef _WIN32
@@ -274,7 +275,8 @@ inline void RecalculateCachedModelMetrics() {
 }
 
 // =============================================================================
-// 4. 标尺绘制模块 (Symmetric Titanium Background 风格自适应物理标尺)
+// 【重构版】：高保真物理标尺渲染器 (基于屏幕目标像素间距反向自适应解算)
+//  支持在任意超大网格尺度下完美、均匀、永不重叠地呈现整百/整千标定数字
 // =============================================================================
 inline void RenderGridRulerOnBackbuffer(
     const SimulationContext& ctx,
@@ -300,28 +302,48 @@ inline void RenderGridRulerOnBackbuffer(
         aspectCorr.y = simAspect / winAspect;
     }
 
-    // 根据当前的缩放比动态调节刻度的间距，防止文字重叠
-    float spacing = 50.0f;
-    if (viewZoom < 0.35f)  spacing = 100.0f;
-    if (viewZoom < 0.15f)  spacing = 200.0f;
-    if (viewZoom < 0.06f)  spacing = 500.0f;
-    if (viewZoom > 2.2f)   spacing = 20.0f;
-    if (viewZoom > 5.0f)   spacing = 10.0f;
-    if (viewZoom > 12.0f)  spacing = 5.0f;
+    // =========================================================================
+    // 【核心新增】：基于 100 像素目标间距的 X / Y 轴物理步长自适应解算器
+    // =========================================================================
+    auto calcNiceInterval = [&](float target_pixel_dist, float total_cells, float aspect_corr, float win_dim) -> float {
+        // 1. 反向换算 100 像素在当前缩放率下对应的理论物理距离 (米)
+        float target_phys = (target_pixel_dist * total_cells * aspect_corr * ctx.h) / (win_dim * viewZoom);
+        if (target_phys <= 0.0f) return 10.0f;
 
-    // A. 绘制顶部 X 轴物理刻度 (100% 像素级对齐)
-    for (float simX = 0.0f; simX <= ctx.NX; simX += spacing) {
+        // 2. 利用 Log10 将其舍入到 10 的 N 次幂基准
+        float log_val = log10f(target_phys);
+        float base_power = powf(10.0f, floorf(log_val));
+        float ratio = target_phys / base_power;
+
+        // 3. 按照标准地学绘图网格比例 (1, 2, 5 划分法) 匹配最美观的步长
+        float nice_interval = base_power;
+        if (ratio > 5.0f)      nice_interval = base_power * 5.0f;
+        else if (ratio > 2.0f) nice_interval = base_power * 2.0f;
+
+        return (nice_interval < 1.0f) ? 1.0f : nice_interval;
+        };
+
+    // 分别解算符合 X 轴和 Y 轴像素分辨率的完美物理间距 (单位：米)
+    float nice_interval_x = calcNiceInterval(100.0f, ctx.NX, aspectCorr.x, (float)winW);
+    float nice_interval_y = calcNiceInterval(100.0f, ctx.NZ, aspectCorr.y, (float)winH);
+
+    // =========================================================================
+    // A. 绘制顶部 X 轴自适应物理刻度 (以物理“米”为循环单位，保证刻度值永远是整百/整十)
+    // =========================================================================
+    float total_width_m = ctx.NX * ctx.h;
+    for (float physX = 0.0f; physX <= total_width_m; physX += nice_interval_x) {
+        // 将物理位置反向折算为网格格数，进行 NDC 变换与像素投影
+        float simX = physX / ctx.h;
         float aPos_x = (simX / (float)ctx.NX) * 2.0f - 1.0f;
         float Pndc_x = (aPos_x - viewOffset.x) * viewZoom / aspectCorr.x;
         float screenX = (Pndc_x * 0.5f + 0.5f) * winW;
 
-        if (screenX >= 0.0f && screenX <= winW) {
+        if (screenX >= 0.0f && screenX <= (float)winW) {
             float screenY = barHeight + 2.0f;
             draw_list->AddLine(ImVec2(screenX, screenY), ImVec2(screenX, screenY + 6.0f), tickCol, 1.5f);
 
-            float physVal = simX * ctx.h;
-            char  buf[32];
-            snprintf(buf, 32, "%.0fm", physVal);
+            char buf[32];
+            snprintf(buf, 32, "%.0fm", physX);
 
             ImVec2 txtSize = ImGui::CalcTextSize(buf);
             float  offsetX = -txtSize.x * 0.5f;
@@ -332,19 +354,22 @@ inline void RenderGridRulerOnBackbuffer(
         }
     }
 
-    // B. 绘制左侧 Y 轴物理深度刻度 (100% 像素级对齐)
-    for (float simY = 0.0f; simY <= ctx.NZ; simY += spacing) {
+    // =========================================================================
+    // B. 绘制左侧 Y 轴自适应深度刻度 (以物理“米”为循环单位)
+    // =============================================================================
+    float total_depth_m = ctx.NZ * ctx.h;
+    for (float physY = 0.0f; physY <= total_depth_m; physY += nice_interval_y) {
+        float simY = physY / ctx.h;
         float aPos_y = 1.0f - (simY / (float)ctx.NZ) * 2.0f;
         float Pndc_y = (aPos_y - viewOffset.y) * viewZoom / aspectCorr.y;
         float screenY = (0.5f - Pndc_y * 0.5f) * winH;
 
-        if (screenY >= barHeight && screenY <= winH) {
+        if (screenY >= barHeight && screenY <= (float)winH) {
             float screenX = 4.0f;
             draw_list->AddLine(ImVec2(screenX, screenY), ImVec2(screenX + 6.0f, screenY), tickCol, 1.5f);
 
-            float physVal = simY * ctx.h;
-            char  buf[32];
-            snprintf(buf, 32, "%.0fm", physVal);
+            char buf[32];
+            snprintf(buf, 32, "%.0fm", physY);
 
             ImVec2 txtSize = ImGui::CalcTextSize(buf);
             ImVec2 pos(screenX + 8.0f, screenY - txtSize.y * 0.5f);
@@ -1531,18 +1556,22 @@ inline bool LoadModelFromSegy(
 // =============================================================================
 // 19. 终极版地层模型导出器 (支持空间局部裁剪 Cropping 与水平翻转导出为 SGY 记录)
 // =============================================================================
+// =============================================================================
+// 【重构后】：支持空间局部裁剪、双向翻转以及动态重采样的 SEGY 模型导出驱动
+// =============================================================================
 inline bool ExportModelToSegy(
     const std::string& base_filepath,
     bool               density_gcm3,
     bool               flipHorizontally,
     int                x_min,
-    int                z_min, // 左上角格点坐标
+    int                z_min,
     int                x_max,
-    int                z_max  // 右下角格点坐标
+    int                z_max,
+    float              target_dx // <-- 【核心新增】：目标导出网格步长 (米)
 ) {
     if (ctx.total_grid <= 0) return false;
 
-    // 1. 安全边界检查与自适应纠错 (防止用户输入颠倒或越界坐标)
+    // 1. 安全边界检查与自适应纠错
     x_min = std::clamp(x_min, 0, ctx.NX - 1);
     x_max = std::clamp(x_max, 0, ctx.NX - 1);
     z_min = std::clamp(z_min, 0, ctx.NZ - 1);
@@ -1552,31 +1581,18 @@ inline bool ExportModelToSegy(
     if (z_min > z_max) std::swap(z_min, z_max);
 
     // 计算裁剪后的新模型尺寸 (新宽度、新深度)
-    int    new_NX = x_max - x_min + 1;
-    int    new_NZ = z_max - z_min + 1;
-    size_t new_total_grid = static_cast<size_t>(new_NX) * new_NZ;
+    int new_NX = x_max - x_min + 1;
+    int new_NZ = z_max - z_min + 1;
 
-    std::cout << "[IO] Preparing Cropped SEGY Export..." << std::endl;
+    std::cout << "[IO] Preparing SEGY Export with Cropping..." << std::endl;
     std::cout << "     - Crop Range: X[" << x_min << " ~ " << x_max << "], Z[" << z_min << " ~ " << z_max << "]" << std::endl;
-    std::cout << "     - Output Size: " << new_NX << "x" << new_NZ << " (Total: " << new_total_grid << " cells)" << std::endl;
+    std::cout << "     - Raw Crop Size: " << new_NX << "x" << new_NZ << std::endl;
 
-    // 自动剔除原有后缀并格式化
-    std::string clean_path = base_filepath;
-    size_t      dot_pos = clean_path.find_last_of('.');
+    // 2. 提取裁剪区域到 CPU 2D 临时缓冲区
+    std::vector<std::vector<float>> cropped_vp(new_NX, std::vector<float>(new_NZ, 0.0f));
+    std::vector<std::vector<float>> cropped_vs(new_NX, std::vector<float>(new_NZ, 0.0f));
+    std::vector<std::vector<float>> cropped_rho(new_NX, std::vector<float>(new_NZ, 0.0f));
 
-    if (dot_pos != std::string::npos) {
-        clean_path = clean_path.substr(0, dot_pos);
-    }
-    std::string out_vp_path = clean_path + "_vp.sgy";
-    std::string out_vs_path = clean_path + "_vs.sgy";
-    std::string out_rho_path = clean_path + "_rho.sgy";
-
-    // 创建裁剪后的 1D 导出缓冲区
-    std::vector<float> flat_vp(new_total_grid, 0.0f);
-    std::vector<float> flat_vs(new_total_grid, 0.0f);
-    std::vector<float> flat_rho(new_total_grid, 0.0f);
-
-    // 2. 核心算法：空间转置与裁剪重组
     for (int x = 0; x < new_NX; ++x) {
         // 如果开启了水平翻转，则对裁剪出的子区域进行左右镜像
         int targetX = flipHorizontally ? (x_max - x) : (x_min + x);
@@ -1585,7 +1601,6 @@ inline bool ExportModelToSegy(
             int targetZ = z_min + z; // 对齐深度
 
             int k_cuda = targetZ * ctx.NX + targetX; // 读取全网格中对应的位置
-            int k_segy = x * new_NZ + z;             // 写入新模型的 SEGY 道内位置
 
             float rho_val = ctx.rho[k_cuda];
             float vp_val = 0.0f;
@@ -1596,24 +1611,69 @@ inline bool ExportModelToSegy(
                 vs_val = sqrtf(ctx.mu[k_cuda] / rho_val);
             }
 
-            flat_vp[k_segy] = vp_val;
-            flat_vs[k_segy] = vs_val;
+            cropped_vp[x][z] = vp_val;
+            cropped_vs[x][z] = vs_val;
 
-            if (density_gcm3) {
-                flat_rho[k_segy] = rho_val / 1000.0f;
-            }
-            else {
-                flat_rho[k_segy] = rho_val;
-            }
+            // 物理单位换算
+            if (density_gcm3) cropped_rho[x][z] = rho_val / 1000.0f;
+            else              cropped_rho[x][z] = rho_val;
         }
     }
 
-    float dummy_dt = 0.001f;
-    SeismicIO::writeSegyFile2D(flat_vp, new_NX, new_NZ, out_vp_path, dummy_dt);
-    SeismicIO::writeSegyFile2D(flat_vs, new_NX, new_NZ, out_vs_path, dummy_dt);
-    SeismicIO::writeSegyFile2D(flat_rho, new_NX, new_NZ, out_rho_path, dummy_dt);
+    // 3. 【核心新增】：物理重采样管线对齐
+    std::vector<std::vector<float>> final_vp, final_vs, final_rho;
+    int export_NX = new_NX;
+    int export_NZ = new_NZ;
 
-    std::cout << "[IO] Cropped Model Export Completed." << std::endl;
+    // 只有当目标步长大于 0 且与当前步长不同时，才触发二维重采样插值
+    if (target_dx > 0.0f && std::abs(target_dx - ctx.h) > 1e-4f) {
+        std::cout << "     - [Trigger] Resampling sub-grid: " << ctx.h << "m -> " << target_dx << "m" << std::endl;
+        final_vp = ResampleGrid2D(cropped_vp, target_dx, ctx.h);
+        final_vs = ResampleGrid2D(cropped_vs, target_dx, ctx.h);
+        final_rho = ResampleGrid2D(cropped_rho, target_dx, ctx.h);
+
+        // 刷新重采样后的真实尺寸
+        export_NX = static_cast<int>(final_vp.size());
+        export_NZ = static_cast<int>(final_vp[0].size());
+    }
+    else {
+        final_vp = cropped_vp;
+        final_vs = cropped_vs;
+        final_rho = cropped_rho;
+    }
+
+    // 4. 将 2D 物理网格展平为 1D 导出向量
+    size_t             export_total_grid = static_cast<size_t>(export_NX) * export_NZ;
+    std::vector<float> flat_vp(export_total_grid);
+    std::vector<float> flat_vs(export_total_grid);
+    std::vector<float> flat_rho(export_total_grid);
+
+    for (int x = 0; x < export_NX; ++x) {
+        for (int z = 0; z < export_NZ; ++z) {
+            size_t k_segy = (size_t)x * export_NZ + z; // SEGY 要求的道内排列次序
+            flat_vp[k_segy] = final_vp[x][z];
+            flat_vs[k_segy] = final_vs[x][z];
+            flat_rho[k_segy] = final_rho[x][z];
+        }
+    }
+
+    // 5. 自动格式化文件路径并写出二进制文件
+    std::string clean_path = base_filepath;
+    size_t      dot_pos = clean_path.find_last_of('.');
+    if (dot_pos != std::string::npos) {
+        clean_path = clean_path.substr(0, dot_pos);
+    }
+    std::string out_vp_path = clean_path + "_vp.sgy";
+    std::string out_vs_path = clean_path + "_vs.sgy";
+    std::string out_rho_path = clean_path + "_rho.sgy";
+
+    float dummy_dt = 0.001f; // 模型文件的标称垂直间隔
+    SeismicIO::writeSegyFile2D(flat_vp, export_NX, export_NZ, out_vp_path, dummy_dt);
+    SeismicIO::writeSegyFile2D(flat_vs, export_NX, export_NZ, out_vs_path, dummy_dt);
+    SeismicIO::writeSegyFile2D(flat_rho, export_NX, export_NZ, out_rho_path, dummy_dt);
+
+    std::cout << "[IO] Resampled SEGY Model Group Export Completed successfully." << std::endl;
+    std::cout << "     - Final Output Size: " << export_NX << " traces x " << export_NZ << " samples" << std::endl;
     return true;
 }
 
@@ -2235,18 +2295,33 @@ inline void HandleSeismicInteractions(SimState& state, int winW, int winH, float
             }
         }
     }
-
-    // D. 鼠标中键拖拽平移与滚轮视口缩放
+    // =============================================================================
+    // D. 鼠标中键拖拽平移与滚轮视口缩放 (修正版：引入 aspectCorr 彻底消除拖拽粘滞感)
+    // =============================================================================
     if (!io.WantCaptureMouse) {
+        // 1. 动态计算当前视口的自适应长宽比修正系数
+        float winAspect = (float)winW / (float)winH;
+        float simAspect = (float)ctx.NX / (float)ctx.NZ;
+        ImVec2 aspectCorr = { 1.0f, 1.0f };
+        if (winAspect > simAspect) {
+            aspectCorr.x = winAspect / simAspect;
+        }
+        else {
+            aspectCorr.y = simAspect / winAspect;
+        }
+
+        // 2. 滚轮无级缩放
         if (io.MouseWheel != 0) {
             float mouseSpeed = 0.1f * viewZoom;
             viewZoom += io.MouseWheel * mouseSpeed;
             if (viewZoom < 0.1f)   viewZoom = 0.1f;
             if (viewZoom > 100.0f) viewZoom = 100.0f;
         }
+
+        // 3. 鼠标中键平移 (核心修复：乘上 aspectCorr 修正，使模型位移与鼠标位移实现 1:1 精确对齐)
         if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
-            viewOffset.x -= 2 * io.MouseDelta.x / (winW * viewZoom);
-            viewOffset.y += 2 * io.MouseDelta.y / (winH * viewZoom);
+            viewOffset.x -= 2.0f * io.MouseDelta.x * aspectCorr.x / (winW * viewZoom);
+            viewOffset.y += 2.0f * io.MouseDelta.y * aspectCorr.y / (winH * viewZoom);
         }
     }
 
@@ -2618,7 +2693,7 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                     }
 
                     ImGui::SliderFloat("Time Step (dt)", &temp_dt, 0.00001f, 0.003f, "%.6f s");
-                    ImGui::SliderFloat("Grid Spacing (dx)", &temp_dx, 0.1f, 20.0f, "%.1f m");
+                    ImGui::SliderFloat("Grid Spacing (dx)", &temp_dx, 0.1f, 20.0f, "%.2f m");
                     // =========================================================================
                     // 【优化】：开放 PML 宽度下限至 0，实现一键无缝切换至“物理全反射模式”
                     // =========================================================================
@@ -3140,6 +3215,11 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                         crop_z_max = ctx.NZ - 1;
                     }
 
+                    // 【自适应对齐】：每次切换模型时，自动将默认导出目标步长设为当前模拟的步长 ctx.h
+                    if (first_align_needed) {
+                        export_target_dx = ctx.h;
+                    }
+
                     ImGui::Checkbox("Convert Density to g/cm3 on Export", &export_density_gcm3);
                     ImGui::Checkbox("Flip Horizontally on Export", &export_flip_x);
 
@@ -3148,6 +3228,14 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                     ImGui::SliderInt("X Max (Right)", &crop_x_max, 0, ctx.NX - 1);
                     ImGui::SliderInt("Z Min (Top)", &crop_z_min, 0, ctx.NZ - 1);
                     ImGui::SliderInt("Z Max (Bottom)", &crop_z_max, 0, ctx.NZ - 1);
+
+                    // =========================================================
+                    // 【核心新增】：重采样目标空间步长调节滑块
+                    // =========================================================
+                    ImGui::SliderFloat("Export Target dx (m)", &export_target_dx, 0.1f, 20.0f, "%.2f m");
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Target spatial spacing for exported SGY grid.\nSetting this different from active dx will trigger 2D Resampling.\ne.g., downsample Marmousi from 1.5m to 2.5m.");
+                    }
 
                     float sub_btn_w = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2.0f;
 
@@ -3172,8 +3260,9 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                     if (ImGui::Button("EXPORT SEG-Y GROUP", { -1, 35 * scale })) {
                         char savePath[512] = { 0 };
                         if (SaveSystemFileDialog(savePath, sizeof(savePath))) {
-                            if (ExportModelToSegy(savePath, export_density_gcm3, export_flip_x, crop_x_min, crop_z_min, crop_x_max, crop_z_max)) {
-                                popup_message = "Cropped SEGY Model Group exported successfully!\nCheck out your saved _vp, _vs, _rho files.";
+                            // 传入新参数 export_target_dx 进行高保真重采样导出
+                            if (ExportModelToSegy(savePath, export_density_gcm3, export_flip_x, crop_x_min, crop_z_min, crop_x_max, crop_z_max, export_target_dx)) {
+                                popup_message = "Cropped & Resampled SEGY Model Group exported successfully!\nCheck out your saved _vp, _vs, _rho files.";
                                 show_success_popup = true;
                             }
                             else {
