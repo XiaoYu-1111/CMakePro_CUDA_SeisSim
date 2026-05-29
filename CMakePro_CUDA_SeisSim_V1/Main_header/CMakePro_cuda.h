@@ -2732,4 +2732,12 @@ void ProcessInput(GLFWwindow* window, SimConfig& cfg, SimState& state, GLHandles
         state.running = !state.running;
     }
     spaceWasPressed = spaceIsPressed;
+
+
+    // --- 【键盘 1-5 键一键热切换画笔工具模式】 ---
+    if (glfwGetKey(window, GLFW_KEY_1) == GLFW_PRESS) state.brushType = TOOL_NONE;   // 1键：默认震源
+    if (glfwGetKey(window, GLFW_KEY_2) == GLFW_PRESS) state.brushType = TOOL_HIGH;   // 2键：高速体
+    if (glfwGetKey(window, GLFW_KEY_3) == GLFW_PRESS) state.brushType = TOOL_LOW;    // 3键：低速体
+    if (glfwGetKey(window, GLFW_KEY_4) == GLFW_PRESS) state.brushType = TOOL_WALL;   // 4键：自定义刷
+    if (glfwGetKey(window, GLFW_KEY_5) == GLFW_PRESS) state.brushType = TOOL_ERASER; // 5键：橡皮擦
 }

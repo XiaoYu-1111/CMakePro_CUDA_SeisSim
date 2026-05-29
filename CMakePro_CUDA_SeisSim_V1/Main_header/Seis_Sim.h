@@ -274,6 +274,104 @@ inline void RecalculateCachedModelMetrics() {
     cached_vram_mb = static_cast<float>(estimated_bytes) / (1024.0f * 1024.0f);
 }
 
+
+// =============================================================================
+// 11. 离屏非均匀地质物性纹理打包上传器
+// =============================================================================
+inline void UpdateModelTexture() {
+    if (g_modelTex == 0) {
+        glGenTextures(1, &g_modelTex);
+    }
+
+    std::vector<float> temp_data(ctx.total_grid * 4, 0.0f);
+
+    for (int i = 0; i < ctx.total_grid; ++i) {
+        float rho = ctx.rho[i];
+        float vp = 0.0f;
+        float vs = 0.0f;
+        if (rho > 0.0f) {
+            vp = sqrtf(ctx.lambda2mu[i] / rho);
+            vs = sqrtf(ctx.mu[i] / rho);
+        }
+
+        // 归一化后存入对应通道
+        temp_data[i * 4 + 0] = vp / 6000.0f;  // R 通道: 纵波速度 Vp (映射至 6000m/s)
+        temp_data[i * 4 + 1] = vs / 3500.0f;  // G 通道: 横波速度 Vs
+        temp_data[i * 4 + 2] = rho / 3000.0f; // B 通道: 密度 Rho
+        temp_data[i * 4 + 3] = 1.0f;          // A 通道
+    }
+
+    glBindTexture(GL_TEXTURE_2D, g_modelTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, ctx.NX, ctx.NZ, 0, GL_RGBA, GL_FLOAT, temp_data.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+// =============================================================================
+// 【核心新增】：一键同步 CPU 地层修改至 GPU 并刷新地质背景纹理图层
+// =============================================================================
+inline void UploadMaterialToGPU() {
+    if (ctx.total_grid <= 0) return;
+
+    size_t bytes = ctx.total_grid * sizeof(float);
+
+    // 1. 将修改后的基础弹性拉梅常数与密度矩阵重新拷入显存
+    CUDA_CHECK(cudaMemcpy(gpu_data.d_rho, ctx.rho.data(), bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(gpu_data.d_mu, ctx.mu.data(), bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(gpu_data.d_lambda, ctx.lambda.data(), bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(gpu_data.d_lambda2mu, ctx.lambda2mu.data(), bytes, cudaMemcpyHostToDevice));
+
+    // 2. 如果当前运行在 Type 2 PML (非分裂混合) 下，必须重新重组并拷入平展的半步长各向异性介质场 [3]
+    if (gpu_data.flag_type == 2) {
+        std::vector<float> mu_x(ctx.total_grid, 0.0f), lambda_x(ctx.total_grid, 0.0f), l2m_x(ctx.total_grid, 0.0f);
+        std::vector<float> mu_z(ctx.total_grid, 0.0f), rho_xz(ctx.total_grid, 0.0f), rho_orig(ctx.total_grid, 0.0f);
+        for (int i = 0; i < ctx.NZ; ++i) {
+            for (int j = 0; j < ctx.NX; ++j) {
+                int k = i * ctx.NX + j;
+                rho_orig[k] = ctx.rho[k];
+                int k_next_x = (j < ctx.NX - 1) ? k + 1 : k;
+                int k_next_z = (i < ctx.NZ - 1) ? k + ctx.NX : k;
+                mu_x[k] = 0.5f * (ctx.mu[k] + ctx.mu[k_next_x]);
+                lambda_x[k] = 0.5f * (ctx.lambda[k] + ctx.lambda[k_next_x]);
+                l2m_x[k] = 0.5f * (ctx.lambda2mu[k] + ctx.lambda2mu[k_next_x]);
+                mu_z[k] = 0.5f * (ctx.mu[k] + ctx.mu[k_next_z]);
+                int k_dr = (i < ctx.NZ - 1 && j < ctx.NX - 1) ? k + ctx.NX + 1 : k;
+                rho_xz[k] = 0.25f * (ctx.rho[k] + ctx.rho[k_next_x] + ctx.rho[k_next_z] + ctx.rho[k_dr]);
+                if (rho_xz[k] < 1.0f) rho_xz[k] = 1000.0f;
+            }
+        }
+        CUDA_CHECK(cudaMemcpy(gpu_data.d_mu_x_flat, mu_x.data(), bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gpu_data.d_lambda_x_flat, lambda_x.data(), bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gpu_data.d_lambda2mu_x_flat, l2m_x.data(), bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gpu_data.d_mu_z_flat, mu_z.data(), bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gpu_data.d_rho_x_z_flat, rho_xz.data(), bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gpu_data.d_rho_orig_flat, rho_orig.data(), bytes, cudaMemcpyHostToDevice));
+    }
+
+    // 3. 如果当前在 Type 3 PML (自由表面) 下，重新计算自由表面 dp_flat 阻抗
+    if (gpu_data.flag_type == 3) {
+        ctx.dp_flat.assign(ctx.NX, 0.0f);
+        int fs_idx = ctx.npml;
+        for (int j = 0; j < ctx.NX; ++j) {
+            int k = fs_idx * ctx.NX + j;
+            if (k < ctx.total_grid && ctx.lambda2mu[k] > 0.0f) {
+                float l2m = ctx.lambda2mu[k];
+                float lam = ctx.lambda[k];
+                ctx.dp_flat[j] = (l2m * l2m - lam * lam) / l2m;
+            }
+        }
+        CUDA_CHECK(cudaMemcpy(gpu_data.d_dp_flat, ctx.dp_flat.data(), ctx.NX * sizeof(float), cudaMemcpyHostToDevice));
+    }
+
+    // 4. 重算 CPU 侧物理极值与显存估算缓存 [3]
+    RecalculateCachedModelMetrics();
+
+    // 5. 重新上传并刷新离屏背景地层纹理图层，使 OpenGL 视口立即显示出画笔划过的层位颜色！
+    UpdateModelTexture();
+}
+
 // =============================================================================
 // 【重构版】：高保真物理标尺渲染器 (基于屏幕目标像素间距反向自适应解算)
 //  支持在任意超大网格尺度下完美、均匀、永不重叠地呈现整百/整千标定数字
@@ -1056,40 +1154,6 @@ inline void LoadScenario(int type) {
     }
 }
 
-// =============================================================================
-// 11. 离屏非均匀地质物性纹理打包上传器
-// =============================================================================
-inline void UpdateModelTexture() {
-    if (g_modelTex == 0) {
-        glGenTextures(1, &g_modelTex);
-    }
-
-    std::vector<float> temp_data(ctx.total_grid * 4, 0.0f);
-
-    for (int i = 0; i < ctx.total_grid; ++i) {
-        float rho = ctx.rho[i];
-        float vp = 0.0f;
-        float vs = 0.0f;
-        if (rho > 0.0f) {
-            vp = sqrtf(ctx.lambda2mu[i] / rho);
-            vs = sqrtf(ctx.mu[i] / rho);
-        }
-
-        // 归一化后存入对应通道
-        temp_data[i * 4 + 0] = vp / 6000.0f;  // R 通道: 纵波速度 Vp (映射至 6000m/s)
-        temp_data[i * 4 + 1] = vs / 3500.0f;  // G 通道: 横波速度 Vs
-        temp_data[i * 4 + 2] = rho / 3000.0f; // B 通道: 密度 Rho
-        temp_data[i * 4 + 3] = 1.0f;          // A 通道
-    }
-
-    glBindTexture(GL_TEXTURE_2D, g_modelTex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, ctx.NX, ctx.NZ, 0, GL_RGBA, GL_FLOAT, temp_data.data());
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glBindTexture(GL_TEXTURE_2D, 0);
-}
 
 // =============================================================================
 // 12. 弹性场景重装一键应用驱动
@@ -2225,6 +2289,15 @@ inline void HandleSeismicInteractions(SimState& state, int winW, int winH, float
         modelStyle = (modelStyle + 1) % 5;
     }
 
+    // 【核心新增】：键盘数字键 1 - 5 快速一键切换当前鼠标画笔工具模式
+    if (!io.WantCaptureKeyboard) {
+        if (ImGui::IsKeyPressed(ImGuiKey_1)) state.brushType = TOOL_NONE;   // 1 键：恢复默认单点震源
+        if (ImGui::IsKeyPressed(ImGuiKey_2)) state.brushType = TOOL_HIGH;   // 2 键：切换为硬岩高速体刷
+        if (ImGui::IsKeyPressed(ImGuiKey_3)) state.brushType = TOOL_LOW;    // 3 键：切换为松散层低速体刷
+        if (ImGui::IsKeyPressed(ImGuiKey_4)) state.brushType = TOOL_WALL;   // 4 键：切换为自定义物性刷
+        if (ImGui::IsKeyPressed(ImGuiKey_5)) state.brushType = TOOL_ERASER; // 5 键：切换为橡皮擦
+    }
+
     // 计算屏幕缩放比例系数
     float  winAspect = (float)winW / (float)winH;
     float  simAspect = (float)ctx.NX / (float)ctx.NZ;
@@ -2249,7 +2322,7 @@ inline void HandleSeismicInteractions(SimState& state, int winW, int winH, float
         }
     }
 
-    if (!io.WantCaptureMouse && trigger_active) {
+    if (!io.WantCaptureMouse) {
         float normX = io.MousePos.x / (float)winW;
         float normY = io.MousePos.y / (float)winH;
 
@@ -2259,100 +2332,154 @@ inline void HandleSeismicInteractions(SimState& state, int winW, int winH, float
         int mx = (int)(worldX * (float)ctx.NX);
         int my = (int)(worldY * (float)ctx.NZ);
 
-        int min_valid = ctx.npml + 0;
-        int max_valid_x = ctx.NX - ctx.npml - 0;
-        int max_valid_z = ctx.NZ - ctx.npml - 0;
+        if (state.brushType == TOOL_NONE) {
+            // -----------------------------------------------------------------
+            // 1. 【默认单点激发模式】：放置单点震源并重新计算
+            // -----------------------------------------------------------------
+            if (trigger_active) {
+                int min_valid = ctx.npml + 0;
+                int max_valid_x = ctx.NX - ctx.npml - 0;
+                int max_valid_z = ctx.NZ - ctx.npml - 0;
 
-        if (mx >= min_valid && mx <= max_valid_x && my >= min_valid && my <= max_valid_z) {
-            int clicked_idx = my * ctx.NX + mx;
+                if (mx >= min_valid && mx <= max_valid_x && my >= min_valid && my <= max_valid_z) {
+                    int clicked_idx = my * ctx.NX + mx;
 
-            if (multi_source_mode) {
-                GPUSource new_src;
-                new_src.idx = clicked_idx;
-                new_src.t = 0.0f;
-                new_src.f_peak = edit_f0;
-                new_src.amp = 1.0f;
+                    if (multi_source_mode) {
+                        GPUSource new_src;
+                        new_src.idx = clicked_idx;
+                        new_src.t = 0.0f;
+                        new_src.f_peak = edit_f0;
+                        new_src.amp = 1.0f;
 
-                if (active_sources.size() < 150) {
-                    active_sources.push_back(new_src);
+                        if (active_sources.size() < 150) {
+                            active_sources.push_back(new_src);
+                        }
+                        edit_src_x = mx;
+                        edit_src_z = my;
+                    }
+                    else {
+                        ctx.src_z_idx = my;
+                        ctx.src_idx = clicked_idx;
+                        edit_src_x = mx;
+                        edit_src_z = my;
+                        current_it = 0;
+                        state.running = true;
+                        accumulated_compute_time = 0.0f;
+
+                        freeGPUSimulation(gpu_data);
+                        initGPUSimulation(gpu_data, ctx);
+                        std::fill(ctx.record_vx.begin(), ctx.record_vx.end(), 0.0f);
+                        std::fill(ctx.record_vz.begin(), ctx.record_vz.end(), 0.0f);
+                    }
                 }
-                edit_src_x = mx;
-                edit_src_z = my;
             }
-            else {
-                ctx.src_z_idx = my;
-                ctx.src_idx = clicked_idx;
-                edit_src_x = mx;
-                edit_src_z = my;
-                current_it = 0;
-                state.running = true;
-                accumulated_compute_time = 0.0f;
-
-                freeGPUSimulation(gpu_data);
-                initGPUSimulation(gpu_data, ctx);
-                std::fill(ctx.record_vx.begin(), ctx.record_vx.end(), 0.0f);
-                std::fill(ctx.record_vz.begin(), ctx.record_vz.end(), 0.0f);
-            }
-        }
-    }
-    // =============================================================================
-    // D. 鼠标中键拖拽平移与滚轮视口缩放 (修正版：引入 aspectCorr 彻底消除拖拽粘滞感)
-    // =============================================================================
-    if (!io.WantCaptureMouse) {
-        // 1. 动态计算当前视口的自适应长宽比修正系数
-        float winAspect = (float)winW / (float)winH;
-        float simAspect = (float)ctx.NX / (float)ctx.NZ;
-        ImVec2 aspectCorr = { 1.0f, 1.0f };
-        if (winAspect > simAspect) {
-            aspectCorr.x = winAspect / simAspect;
         }
         else {
-            aspectCorr.y = simAspect / winAspect;
+            // -----------------------------------------------------------------
+            // 2. 【模型涂画编辑模式】：按住左键不放即可在当前位置执行物性涂抹
+            // -----------------------------------------------------------------
+            if (ImGui::IsMouseDown(0)) {
+                int  r_cells = static_cast<int>(state.brushRadius);
+                bool model_changed = false;
+
+                // 2.1 设定不同画笔形态的目标物理参数
+                float p_vp = 3000.0f, p_vs = 1732.0f, p_rho = 2200.0f;
+                if (state.brushType == TOOL_HIGH) {
+                    p_vp = 4800.0f; p_vs = 2800.0f; p_rho = 2500.0f; // 高速体 (硬岩)
+                }
+                else if (state.brushType == TOOL_LOW) {
+                    p_vp = 1500.0f; p_vs = 800.0f;  p_rho = 1800.0f; // 低速体 (松散泥质/砂岩)
+                }
+                else if (state.brushType == TOOL_WALL) {
+                    p_vp = edit_Vp; p_vs = edit_Vs;  p_rho = edit_Density; // 自定义物性笔 (与 UI 共享)
+                }
+                else if (state.brushType == TOOL_ERASER) {
+                    p_vp = 3000.0f; p_vs = 1732.0f; p_rho = 2200.0f; // 橡皮擦：恢复为背景标准层
+                }
+
+                // 2.2 空间圆形邻域涂刷算法
+                for (int dy = -r_cells; dy <= r_cells; ++dy) {
+                    for (int dx = -r_cells; dx <= r_cells; ++dx) {
+                        if (dx * dx + dy * dy <= r_cells * r_cells) {
+                            int target_x = mx + dx;
+                            int target_y = my + dy; // 屏幕深度 (0为地表, NZ-1为底部)
+
+                            if (target_x >= 0 && target_x < ctx.NX && target_y >= 0 && target_y < ctx.NZ) {
+                                // 【核心物理转换】：SetMaterialAt 内部 y=0 对应地底，
+                                // 因此需在此处进行一次垂直对齐转换：y_cpu = NZ - 1 - y_screen
+                                int cpu_y = ctx.NZ - 1 - target_y;
+                                SetMaterialAt(target_x, cpu_y, p_vp, p_vs, p_rho);
+                                model_changed = true;
+                            }
+                        }
+                    }
+                }
+
+                // 2.3 触发高速显存同步与纹理重绘
+                if (model_changed) {
+                    UploadMaterialToGPU();
+                }
+            }
+        }
+        // =============================================================================
+        // D. 鼠标中键拖拽平移与滚轮视口缩放 (修正版：引入 aspectCorr 彻底消除拖拽粘滞感)
+        // =============================================================================
+        if (!io.WantCaptureMouse) {
+            // 1. 动态计算当前视口的自适应长宽比修正系数
+            float winAspect = (float)winW / (float)winH;
+            float simAspect = (float)ctx.NX / (float)ctx.NZ;
+            ImVec2 aspectCorr = { 1.0f, 1.0f };
+            if (winAspect > simAspect) {
+                aspectCorr.x = winAspect / simAspect;
+            }
+            else {
+                aspectCorr.y = simAspect / winAspect;
+            }
+
+            // 2. 滚轮无级缩放
+            if (io.MouseWheel != 0) {
+                float mouseSpeed = 0.1f * viewZoom;
+                viewZoom += io.MouseWheel * mouseSpeed;
+                if (viewZoom < 0.1f)   viewZoom = 0.1f;
+                if (viewZoom > 100.0f) viewZoom = 100.0f;
+            }
+
+            // 3. 鼠标中键平移 (核心修复：乘上 aspectCorr 修正，使模型位移与鼠标位移实现 1:1 精确对齐)
+            if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+                viewOffset.x -= 2.0f * io.MouseDelta.x * aspectCorr.x / (winW * viewZoom);
+                viewOffset.y += 2.0f * io.MouseDelta.y * aspectCorr.y / (winH * viewZoom);
+            }
         }
 
-        // 2. 滚轮无级缩放
-        if (io.MouseWheel != 0) {
-            float mouseSpeed = 0.1f * viewZoom;
-            viewZoom += io.MouseWheel * mouseSpeed;
-            if (viewZoom < 0.1f)   viewZoom = 0.1f;
-            if (viewZoom > 100.0f) viewZoom = 100.0f;
+        ImVec2 mousePos = ImGui::GetMousePos();
+
+        // E. 鼠标悬停位置逆向映射与物性监控
+        is_mouse_inside = (mousePos.x >= 0.0f && mousePos.x < (float)winW &&
+            mousePos.y >= barHeight && mousePos.y < (float)(winH - barHeight));
+
+        if (io.WantCaptureMouse) {
+            is_mouse_inside = false;
         }
 
-        // 3. 鼠标中键平移 (核心修复：乘上 aspectCorr 修正，使模型位移与鼠标位移实现 1:1 精确对齐)
-        if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
-            viewOffset.x -= 2.0f * io.MouseDelta.x * aspectCorr.x / (winW * viewZoom);
-            viewOffset.y += 2.0f * io.MouseDelta.y * aspectCorr.y / (winH * viewZoom);
-        }
-    }
+        hover_valid = false;
+        if (is_mouse_inside) {
+            float normX = mousePos.x / (float)winW;
+            float normY = mousePos.y / (float)winH;
 
-    ImVec2 mousePos = ImGui::GetMousePos();
+            float worldX = (normX - 0.5f) * (aspectCorr.x / viewZoom) + 0.5f + (0.5f * viewOffset.x);
+            float worldY = (normY - 0.5f) * (aspectCorr.y / viewZoom) + 0.5f - (0.5f * viewOffset.y);
 
-    // E. 鼠标悬停位置逆向映射与物性监控
-    is_mouse_inside = (mousePos.x >= 0.0f && mousePos.x < (float)winW &&
-        mousePos.y >= barHeight && mousePos.y < (float)(winH - barHeight));
+            hover_mx = (int)(worldX * (float)ctx.NX);
+            hover_my = (int)(worldY * (float)ctx.NZ);
 
-    if (io.WantCaptureMouse) {
-        is_mouse_inside = false;
-    }
-
-    hover_valid = false;
-    if (is_mouse_inside) {
-        float normX = mousePos.x / (float)winW;
-        float normY = mousePos.y / (float)winH;
-
-        float worldX = (normX - 0.5f) * (aspectCorr.x / viewZoom) + 0.5f + (0.5f * viewOffset.x);
-        float worldY = (normY - 0.5f) * (aspectCorr.y / viewZoom) + 0.5f - (0.5f * viewOffset.y);
-
-        hover_mx = (int)(worldX * (float)ctx.NX);
-        hover_my = (int)(worldY * (float)ctx.NZ);
-
-        if (hover_mx >= 0 && hover_mx < ctx.NX && hover_my >= 0 && hover_my < ctx.NZ) {
-            int k = hover_my * ctx.NX + hover_mx;
-            hover_Rho = ctx.rho[k];
-            if (hover_Rho > 0.0f) {
-                hover_Vp = sqrtf(ctx.lambda2mu[k] / hover_Rho);
-                hover_Vs = sqrtf(ctx.mu[k] / hover_Rho);
-                hover_valid = true;
+            if (hover_mx >= 0 && hover_mx < ctx.NX && hover_my >= 0 && hover_my < ctx.NZ) {
+                int k = hover_my * ctx.NX + hover_mx;
+                hover_Rho = ctx.rho[k];
+                if (hover_Rho > 0.0f) {
+                    hover_Vp = sqrtf(ctx.lambda2mu[k] / hover_Rho);
+                    hover_Vs = sqrtf(ctx.mu[k] / hover_Rho);
+                    hover_valid = true;
+                }
             }
         }
     }
@@ -3015,7 +3142,7 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                 // ==========================================
                 // Tab 3: Model_INPUT 外部导入与物理耦合
                 // ==========================================
-                if (ImGui::BeginTabItem("Model_INPUT")) {
+                if (ImGui::BeginTabItem("Model Edit")) {
                     ImGui::Spacing();
                     ImGui::TextColored(uiAccent, "Rock Physics Coupling");
 
@@ -3080,6 +3207,51 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                     }
                     ImGui::Spacing();
 
+                    // =========================================================================
+                    // 1. 【新增】：鼠标左键画笔与激发工具下拉菜单 (12345 对齐)
+                    // =========================================================================
+                    ImGui::SeparatorText("Mouse Interaction Tool");
+
+                    // 下拉菜单显示文本，与 ToolMode (0 ~ 4) 的 1、2、3、4、5 键完美对齐
+                    const char* brush_names[] = {
+                        "1. Default (Trigger Source） ",//默认激发震源
+                        "2. High Velocity Brush ",//(高速硬岩画笔)
+                        "3. Low Velocity Brush ",//(低速泥层画笔)
+                        "4. Custom Material Brush ",//(自定义物性画笔)
+                        "5. Eraser "//(橡皮擦 / 恢复背景砂岩)
+                    };
+
+                    int current_tool = state.brushType; // 读取当前状态
+                    ImGui::PushItemWidth(-1); // 宽度撑满，视觉上更规整
+
+                    if (ImGui::Combo("##LeftClickToolCombo", &current_tool, brush_names, IM_ARRAYSIZE(brush_names))) {
+                        state.brushType = current_tool; // 鼠标选择时同步更新状态
+                    }
+                    ImGui::PopItemWidth();
+
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Choose what happens when you left-click on the wavefield.\nOr use hotkeys [1] to [5] on your keyboard.");
+                    }
+
+                    // =========================================================================
+                    // 2. 【新增】：画笔大小调节滑块 (仅在选择画笔模式 2, 3, 4, 5 时自动展示)
+                    // =========================================================================
+                    if (state.brushType != TOOL_NONE) {
+                        ImGui::Spacing();
+                        // 调节 brushRadius 半径大小 (1 ~ 50 像素单元)
+                        ImGui::SliderFloat("Brush Radius (px)", &state.brushRadius, 1.0f, 50.0f, "Radius: %.0f px");
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::SetTooltip("Adjust the physical size of your paintbrush circle.");
+                        }
+                    }
+                    ImGui::Spacing();
+                    ImGui::PopStyleColor(2);
+                    ImGui::EndTabItem();
+                }
+                // ==========================================
+                // Tab 4: Model_EXPORT 空间裁剪与 SEGY 导出
+                // ==========================================
+                if (ImGui::BeginTabItem("Model I/O")) {
                     // -------------------------------------------------------------
                     // 外部自定义文本 (TXT) 模型高速加载器
                     // -------------------------------------------------------------
@@ -3188,15 +3360,7 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                             show_error_popup = true;
                         }
                     }
-                    ImGui::Spacing();
-                    ImGui::PopStyleColor(2);
-                    ImGui::EndTabItem();
-                }
-
-                // ==========================================
-                // Tab 4: Model_EXPORT 空间裁剪与 SEGY 导出
-                // ==========================================
-                if (ImGui::BeginTabItem("Model_EXPORT")) {
+                   
                     ImGui::Separator();
                     ImGui::TextColored(uiAccent, "EXPORT CURRENT MODEL TO SEG-Y GROUP");
 
@@ -3395,7 +3559,7 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                 // ==========================================
                 // Tab 5: visual 色谱渲染与标尺网格调节
                 // ==========================================
-                if (ImGui::BeginTabItem("visual")) {
+                if (ImGui::BeginTabItem("Visual")) {
                     ImGui::Spacing();
                     ImGui::SliderFloat("Color Gain", &color_scale, 0.01f, 100.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
 
