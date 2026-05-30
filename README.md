@@ -4,8 +4,9 @@
 ## 导言
 **CMakePro_CUDA_SeisSim_V1** 是一款基于 C++20 标准、NVIDIA CUDA 加速技术、OpenGL 图形管线以及 Dear ImGui 交互架构开发的实时二维弹性波场数值模拟系统。该系统针对浅层地震勘探、岩石物理分析和教学演示设计，旨在提供一个物理参数可调、波场交互即时、画面高渲染品质的数值仿真“沙盒”平台。
 
-![Dashboard Screenshot](PR_CUDA_main.png)
+![Dashboard Screenshot](CMakePro_CUDA_SeisSim_V1/Pro_Picture/PR_CUDA_main.png)
 ![Dashboard Screenshot](CMakePro_CUDA_SeisSim_V1/Pro_Picture/marmousiA.png)
+![Dashboard Screenshot](CMakePro_CUDA_SeisSim_V1/Pro_Picture/计算效率表.png)
 
 通过将有限差分（FDM）算法迁移至 GPU，并深度优化显存与内存间的传输带宽，该系统在主流移动端显卡（如 RTX 4060 Laptop）上实测达到了 **5.0+ GNUPs**（每秒五十亿次网格点更新）的吞吐量，实现了亚秒级的万步波动方程演化。
 
