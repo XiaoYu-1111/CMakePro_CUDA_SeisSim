@@ -1029,3 +1029,21 @@ void recordReceiverStepGPU(GPUSimData& gpu, int num_rcv, float* h_out_vx, float*
     cudaMemcpy(h_out_vx, gpu.d_record_vx_step, num_rcv * sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_out_vz, gpu.d_record_vz_step, num_rcv * sizeof(float), cudaMemcpyDeviceToHost);
 }
+
+// =============================================================================
+// 【解决循环依赖】：实现 Common.h 中声明的 ReplayManager::uploadFrameToGPU 成员函数
+// =============================================================================
+void ReplayManager::uploadFrameToGPU(int frameIdx, GPUSimData& gpu) {
+    if (frameIdx < 0 || frameIdx >= static_cast<int>(frames.size())) return;
+    size_t bytes = gpu.total_grid * sizeof(float);
+
+    if (gpu.flag_type == 1 || gpu.flag_type == 3) {
+        // 覆盖 vz_1，并将 vz_2 抹零，使其和正好等于当前帧数据
+        cudaMemcpy(gpu.d_vz_1, frames[frameIdx].data(), bytes, cudaMemcpyHostToDevice);
+        cudaMemset(gpu.d_vz_2, 0, bytes);
+    }
+    else if (gpu.flag_type == 2) {
+        cudaMemcpy(gpu.d_vz, frames[frameIdx].data(), bytes, cudaMemcpyHostToDevice);
+    }
+}
+

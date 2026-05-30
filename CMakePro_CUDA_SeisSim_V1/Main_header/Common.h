@@ -64,7 +64,8 @@ enum SceneType {
     SCENE_RANDOM_SCATTER,   // 随机散射介质 (300个气泡)
     SCENE_CURVED,           // 起伏分界面 (正弦层位)
     SCENE_REFRACTION,       // 线性连续速度梯度 (折射回转波)
-    SCENE_PENROSE_ROOM      // 彭罗斯椭圆房间 (波场双焦收敛)
+    SCENE_PENROSE_ROOM,      // 彭罗斯椭圆房间 (波场双焦收敛)
+    SCENE_TOPOGRAPHY
 };
 
 // =============================================================================
@@ -326,6 +327,118 @@ struct PlotContext {
 };
 
 // =============================================================================
+// 【回放核心】：回放状态机枚举
+// =============================================================================
+enum ReplayState {
+    REPLAY_IDLE = 0,
+    REPLAY_RECORDING,
+    REPLAY_PLAYING,
+    REPLAY_PAUSED
+};
+
+// =============================================================================
+// 【回放核心】：大容量高能效 CPU-GPU 协同波场回放管理器
+// =============================================================================
+// =============================================================================
+// 【核心修复】：前向声明 GPUSimData，彻底斩断循环头文件依赖
+// =============================================================================
+struct GPUSimData;
+
+struct ReplayManager {
+    int         maxFrames = 500;  // 限制最大帧数 (防止主机内存溢出)
+    int         recordStride = 5;    // 录制步长 (每 N 步仿真保存 1 帧)
+    float       playbackSpeed = 1.0f; // 播放速度
+    ReplayState state = REPLAY_IDLE;
+
+    int   currentFrameIndex = 0;
+    float currentFrameFloat = 0.0f;
+
+    // 采用 Host 侧内存作为大容量缓冲区，每帧大小为 total_grid * sizeof(float)
+    std::vector<std::vector<float>> frames;
+
+    void clear() {
+        frames.clear();
+        currentFrameIndex = 0;
+        currentFrameFloat = 0.0f;
+        if (state == REPLAY_PLAYING || state == REPLAY_PAUSED) {
+            state = REPLAY_IDLE;
+        }
+    }
+
+    float getMemoryUsageMB() const {
+        if (frames.empty()) return 0.0f;
+        size_t bytes = frames.size() * frames[0].size() * sizeof(float);
+        return static_cast<float>(bytes) / (1024.0f * 1024.0f);
+    }
+
+    // 导出录制的所有时间切片波场电影为标准的二进制文件
+    bool exportToBinary(const std::string& filename, int component_type) {
+        if (frames.empty()) return false;
+        std::ofstream file(filename, std::ios::binary);
+        if (!file.is_open()) return false;
+
+        size_t frame_size = frames[0].size();
+        for (const auto& frame : frames) {
+            file.write(reinterpret_cast<const char*>(frame.data()), frame_size * sizeof(float));
+        }
+        file.close();
+        return true;
+    }
+    // =============================================================================
+    // 【核心新增】：从磁盘载入 raw 二进制波场电影文件
+    // =============================================================================
+    bool importFromBinary(const std::string& filename, int nx, int nz) {
+        std::ifstream file(filename, std::ios::binary);
+        if (!file.is_open()) {
+            std::cerr << "[Replay IO] Error: Cannot open file for reading: " << filename << std::endl;
+            return false;
+        }
+
+        // A. 先清空当前内存中的所有旧帧数据
+        clear();
+
+        // 计算单帧的浮点数点数与字节大小
+        size_t frame_elements = static_cast<size_t>(nx) * nz;
+        size_t frame_bytes = frame_elements * sizeof(float);
+
+        // B. 查询文件的总字节大小
+        file.seekg(0, std::ios::end);
+        long long file_size = file.tellg();
+        file.seekg(0, std::ios::beg);
+
+        // C. 根据单帧字节数自适应推算该文件内含的总帧数
+        int total_frames = static_cast<int>(file_size / frame_bytes);
+        if (total_frames <= 0) {
+            std::cerr << "[Replay IO] Error: File size is too small or grid size mismatch." << std::endl;
+            file.close();
+            return false;
+        }
+
+        // D. 预分配 Host 侧内存缓冲区并逐帧读入
+        frames.resize(total_frames, std::vector<float>(frame_elements));
+        for (int f = 0; f < total_frames; ++f) {
+            file.read(reinterpret_cast<char*>(frames[f].data()), frame_bytes);
+        }
+
+        file.close();
+
+        // E. 重置回放状态机，默认切为暂停状态
+        state = REPLAY_PAUSED;
+        currentFrameIndex = 0;
+        currentFrameFloat = 0.0f;
+
+        std::cout << "[Replay IO] Successfully imported wavefield movie: " << filename
+            << " (" << total_frames << " frames loaded)" << std::endl;
+        return true;
+    }
+
+    // =========================================================================
+    // 【核心修复】：只在此处保留函数声明，具体实现移至 Cuda_Check.cu 中
+    // =========================================================================
+    void uploadFrameToGPU(int frameIdx, GPUSimData& gpu);
+};
+
+// =============================================================================
 // 7. OpenGL 着色器全局加载编译工具函数 (Shader Utilities)
 // =============================================================================
 
@@ -372,3 +485,4 @@ inline GLuint createShader(const std::string& source, GLenum type) {
 
 // 离屏渲染基础几何体的声明
 void InitQuad(GLHandles& gl);
+

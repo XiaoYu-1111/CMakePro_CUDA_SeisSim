@@ -122,6 +122,8 @@ inline float cached_vram_mb = 0.0f; // 估算显存占用
 inline float edit_segy_dx = 1.0f; // 外部导入 SEG-Y 时实际物理道间距 (米)
 inline float export_target_dx = 1.0f; // 导出目标网格间距 (米，默认与当前模拟步长对齐)
 
+inline ReplayManager g_replay; // 全局唯一的波场回放管理实例
+
 
 #ifdef _WIN32
 #include <windows.h>
@@ -1152,6 +1154,35 @@ inline void LoadScenario(int type) {
         edit_src_x = static_cast<int>(cx);
         edit_src_z = static_cast<int>(cy);
     }
+    else if (type == SCENE_TOPOGRAPHY) { // 假设为 SCENE_TOPOGRAPHY
+        // 1. 定义背景物性 (固体围岩)
+        float rockVp = 2500.0f, rockVs = 1443.0f, rockRho = 2000.0f;
+        // 2. 定义空气等效物性 (真空法)
+        float airVp = 340.0f, airVs = 0.0f, airRho = 50.0f; // 密度设为50以保证有限差分卓越的稳定性
+
+        float baseHeight = H * 0.45f; // 山底基础高度
+        float hillAmp = H * 0.15f; // 山丘高度
+        float hillFreq = 2.0f * 3.14159f / W * 1.5f; // 控制山丘的个数
+
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                // 利用正弦函数或高斯函数算一条起伏山地轮廓线 z = f(x)
+                float surfaceZ = baseHeight + hillAmp * sin(x * hillFreq);
+
+                // 注意：在 CPU 坐标系中，y 越小代表深度越深。
+                // 如果 y 大于山地表面高度，说明该点处于地表上方（空气）
+                if (y > surfaceZ) {
+                    SetMaterialAt(x, y, airVp, airVs, airRho);   // 填充低速空气
+                }
+                else {
+                    SetMaterialAt(x, y, rockVp, rockVs, rockRho); // 填充固体山体岩石
+                }
+            }
+        }
+        // 激发点定位在山体内部
+        edit_src_x = W / 2;
+        edit_src_z = H / 2;
+        }
 }
 
 
@@ -1785,6 +1816,54 @@ inline bool LoadSeismicSegy(const std::string& filepath, AnalysisState& state) {
 }
 
 // =============================================================================
+// 【核心新增】：从选择的二进制文件名中，自动逆向解析出 NX 和 NZ 大小 (格式：_NXxNZ_)
+//  支持格式如：marmousi_2267x1401_vz.bin -> w = 2267, z = 1401
+// =============================================================================
+inline bool ParseDimensionsFromPath(const std::string& path, int& out_w, int& out_z) {
+    // 1. 寻找最后一个字母 'x' 或 'X'
+    size_t last_x = path.find_last_of("xX");
+    if (last_x == std::string::npos) return false;
+
+    // 2. 从 'x' 逆向寻找前一个下划线 '_' 或斜杠
+    size_t start_idx = path.find_last_of('_', last_x);
+    if (start_idx == std::string::npos) {
+        start_idx = path.find_last_of("\\/", last_x);
+        if (start_idx == std::string::npos) start_idx = 0;
+        else                                start_idx += 1;
+    }
+    else {
+        start_idx += 1; // 跳过下划线字符
+    }
+
+    // 3. 从 'x' 正向寻找后一个下划线 '_' 或点号 '.'
+    size_t end_idx = path.find_first_of('_', last_x);
+    if (end_idx == std::string::npos) {
+        end_idx = path.find_last_of('.');
+        if (end_idx == std::string::npos || end_idx < last_x) {
+            end_idx = path.size();
+        }
+    }
+
+    if (start_idx >= last_x || last_x >= end_idx) return false;
+
+    // 4. 截取宽度和深度子字符串并转为整数
+    std::string w_str = path.substr(start_idx, last_x - start_idx);
+    std::string z_str = path.substr(last_x + 1, end_idx - last_x - 1);
+
+    // 防呆验证：确保截取的字符串全部为纯数字
+    auto is_digits = [](const std::string& s) {
+        return !s.empty() && std::all_of(s.begin(), s.end(), ::isdigit);
+        };
+
+    if (is_digits(w_str) && is_digits(z_str)) {
+        out_w = std::stoi(w_str);
+        out_z = std::stoi(z_str);
+        return true;
+    }
+    return false;
+}
+
+// =============================================================================
 // 【数据采集核心】：检波器单点位置
 // =============================================================================
 struct ReceiverPos {
@@ -1874,22 +1953,37 @@ inline void TriggerSingleShot(GLHandles& gl, SimState& state) {
 // =============================================================================
 // 将采集的数据导出为带有物理道头坐标的标准 SEG-Y 格式文件
 // =============================================================================
+// =============================================================================
+// 【多分量升级版】：一键自动将采集记录导出为 水平(Vx) 和 垂直(Vz) 双通道 SEG-Y 记录组
+// =============================================================================
 inline void ExportToSegy(const AcquisitionManager& recorder, const std::string& filename) {
     if (recorder.recorded_vz.empty() || recorder.recorded_vz[0].empty()) return;
 
+    // 1. 拼装标准的单道采集元数据道头
     std::vector<SeismicIO::TraceMetadata> metadata(recorder.numChannels);
     for (int i = 0; i < recorder.numChannels; ++i) {
         metadata[i].fieldRecordNum = recorder.currentFileIndex;
         metadata[i].traceInRecord = i + 1;
-        metadata[i].sourceX = static_cast<int32_t>(edit_src_x * ctx.h); // 写入真实的物理炮点坐标 (米)
+        metadata[i].sourceX = static_cast<int32_t>(edit_src_x * ctx.h);
         metadata[i].sourceY = static_cast<int32_t>(edit_src_z * ctx.h);
-        metadata[i].groupX = static_cast<int32_t>(recorder.receivers[i].x * ctx.h); // 写入检波点物理坐标
+        metadata[i].groupX = static_cast<int32_t>(recorder.receivers[i].x * ctx.h);
         metadata[i].groupY = static_cast<int32_t>(recorder.receivers[i].y * ctx.h);
     }
 
     float sample_interval_dt = 1.0f / recorder.samplingRateHz;
-    // 调用上一节扩展的第三个重载函数
-    SeismicIO::writeSegyFile2D(recorder.recorded_vz, metadata, filename, sample_interval_dt);
+
+    // 2. 自动格式化拆分导出路径为 _vx 和 _vz 格式
+    std::string clean_path = filename;
+    size_t      dot_pos = clean_path.find_last_of('.');
+    if (dot_pos != std::string::npos) {
+        clean_path = clean_path.substr(0, dot_pos);
+    }
+
+    // 3. 【核心新增】：一式两份，同步导出高保真水平与垂直地震记录道集！
+    SeismicIO::writeSegyFile2D(recorder.recorded_vx, metadata, clean_path + "_vx.sgy", sample_interval_dt); // 导出水平分量
+    SeismicIO::writeSegyFile2D(recorder.recorded_vz, metadata, clean_path + "_vz.sgy", sample_interval_dt); // 导出垂直分量
+
+    std::cout << "[Acquisition IO] Dual-Component (2C) Seismograms exported successfully." << std::endl;
 }
 
 // CSV 简单格式备份导出
@@ -2558,6 +2652,26 @@ inline void UpdateWavefieldSimulation(SimState& state) {
                     }
                 }
 
+                // =============================================================
+                // 【核心新增】：波场时空快照录制逻辑
+                // =============================================================
+                if (g_replay.state == REPLAY_RECORDING) {
+                    // 根据设置的 Stride 步长进行等间隔抽稀采样
+                    if (current_it % g_replay.recordStride == 0) {
+                        if (g_replay.frames.size() < static_cast<size_t>(g_replay.maxFrames)) {
+                            std::vector<float> h_vz(ctx.total_grid);
+
+                            // 调用原有的 copyWavefieldToHost 将 GPU 端组合好的 Vz 拷贝回 CPU 内存
+                            copyWavefieldToHost(gpu_data, h_vz.data());
+                            g_replay.frames.push_back(h_vz);
+                        }
+                        else {
+                            // 录满后自动转为待机状态
+                            g_replay.state = REPLAY_IDLE;
+                        }
+                    }
+                }
+
                 current_it++;
             }
         }
@@ -3181,7 +3295,8 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                         "Random Scattering",
                         "Sinusoidal Interface",
                         "Linear Velocity Gradient",
-                        "Penrose Room"
+                        "Penrose Room",
+                        "SCENE_TOPOGRAPHY"
                     };
 
                     static int selected_scene = current_scene;
@@ -3553,6 +3668,246 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
                             ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Hint: Deploy receivers first.");
                         }
                     }
+                    ImGui::EndTabItem();
+                }
+
+                // =============================================================
+                // Tab 6: Replay (波场电影回放仪 - 自动解析对齐优化版)
+                // =============================================================
+                if (ImGui::BeginTabItem("Replay")) {
+                    ImGui::Spacing();
+
+                    // ---------------------------------------------------------
+                    // 1. 录制控制与参数 (Recording Controls)
+                    // ---------------------------------------------------------
+                    ImGui::SeparatorText("Recording");
+
+                    ImGui::Columns(2, "rec_layout", false);
+                    ImGui::SetColumnWidth(0, ImGui::GetWindowWidth() * 0.65f);
+
+                    ImGui::SliderInt("Max Frames", &g_replay.maxFrames, 100, 1000);
+
+                    if (g_replay.state == REPLAY_IDLE) {
+                        ImGui::SliderInt("Rec Stride", &g_replay.recordStride, 1, 20, "Every %d frames");
+                    }
+                    else {
+                        ImGui::BeginDisabled();
+                        ImGui::SliderInt("Rec Stride", &g_replay.recordStride, 1, 20, "Every %d frames");
+                        ImGui::EndDisabled();
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Save 1 frame every N simulation steps.");
+                    }
+
+                    // 显卡系统级物理显存监控
+                    size_t free_mem = 0, total_mem = 0;
+                    float used_vram_mb = 0.0f, total_vram_mb = 0.0f;
+                    if (cudaMemGetInfo(&free_mem, &total_mem) == cudaSuccess) {
+                        used_vram_mb = static_cast<float>(total_mem - free_mem) / (1024.0f * 1024.0f);
+                        total_vram_mb = static_cast<float>(total_mem) / (1024.0f * 1024.0f);
+                    }
+                    float estimatedSec = (float)(g_replay.maxFrames * g_replay.recordStride) * ctx.dt;
+
+                    ImGui::TextColored(uiAccent, "GPU VRAM: %.1f / %.1f MB  |  Est. Duration: ~%.2f s", used_vram_mb, total_vram_mb, estimatedSec);
+
+                    ImGui::NextColumn();
+                    float btnH = 55.0f * scale;
+
+                    if (g_replay.state == REPLAY_RECORDING) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.1f, 0.1f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.6f, 0.0f, 0.0f, 1.0f));
+
+                        if (ImGui::Button("STOP\nREC", ImVec2(-1, btnH))) {
+                            g_replay.state = REPLAY_IDLE;
+                        }
+                        ImGui::PopStyleColor(3);
+
+                        float time = (float)ImGui::GetTime();
+                        ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 0.5f + 0.5f * sinf(time * 10.0f)), "REC: %d f", g_replay.frames.size());
+                    }
+                    else {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.5f, 0.2f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.0f, 0.6f, 0.3f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.0f, 0.4f, 0.2f, 1.0f));
+
+                        if (ImGui::Button("START\nREC", ImVec2(-1, btnH))) {
+                            g_replay.clear();
+                            g_replay.state = REPLAY_RECORDING;
+                            state.running = true;
+                        }
+                        ImGui::PopStyleColor(3);
+
+                        if (g_replay.frames.empty()) ImGui::TextDisabled("Buffer Empty");
+                        else                         ImGui::Text("%d Frames", g_replay.frames.size());
+                    }
+
+                    ImGui::Columns(1);
+                    ImGui::Spacing();
+
+                    // ------------------------------------------------------
+                    // 2. 回放控制 (Playback Controls)
+                    // ------------------------------------------------------
+                    ImGui::SeparatorText("Playback Control");
+
+                    bool hasFrames = !g_replay.frames.empty();
+                    if (!hasFrames) ImGui::BeginDisabled();
+
+                    ImGui::SetNextItemWidth(150 * scale);
+                    ImGui::SliderFloat("Speed", &g_replay.playbackSpeed, 0.1f, 5.0f, "%.1fx", ImGuiSliderFlags_Logarithmic);
+                    ImGui::SameLine();
+
+                    float ctrlBtnW = 70.0f * scale;
+
+                    if (g_replay.state == REPLAY_PLAYING) {
+                        if (ImGui::Button("PAUSE", ImVec2(ctrlBtnW, 0))) {
+                            g_replay.state = REPLAY_PAUSED;
+                        }
+                    }
+                    else {
+                        if (ImGui::Button("PLAY", ImVec2(ctrlBtnW, 0))) {
+                            g_replay.state = REPLAY_PLAYING;
+                            state.running = false;
+                        }
+                    }
+
+                    ImGui::SameLine();
+
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.2f, 0.2f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.7f, 0.3f, 0.3f, 1.0f));
+                    if (ImGui::Button("CLEAR", ImVec2(ctrlBtnW, 0))) {
+                        g_replay.clear();
+                    }
+                    ImGui::PopStyleColor(2);
+
+                    ImGui::SameLine();
+
+                    // SAVE 自动拼接： _NXxNZ_vz.bin 
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.7f, 0.3f, 1.0f));
+                    if (ImGui::Button("SAVE", ImVec2(ctrlBtnW, 0))) {
+                        char savePath[512] = { 0 };
+                        if (SaveSystemFileDialog(savePath, sizeof(savePath))) {
+                            std::string path_str(savePath);
+                            size_t dot_pos = path_str.find_last_of('.');
+                            if (dot_pos != std::string::npos) {
+                                path_str = path_str.substr(0, dot_pos);
+                            }
+                            // 核心自动命名：将当前仿真尺寸 (ctx.NX x ctx.NZ) 自动封装进后缀中！
+                            std::string final_path = path_str + "_" + std::to_string(ctx.NX) + "x" + std::to_string(ctx.NZ) + "_vz.bin";
+
+                            if (g_replay.exportToBinary(final_path, 1)) {
+                                popup_message = "Wavefield movie saved with dimensions!\nFile: " + final_path;
+                                show_success_popup = true;
+                            }
+                            else {
+                                popup_message = "Failed to save wavefield movie.";
+                                show_error_popup = true;
+                            }
+                        }
+                    }
+                    ImGui::PopStyleColor(2);
+
+                    if (hasFrames) {
+                        char overlay[64];
+                        sprintf(overlay, "%d / %d f", g_replay.currentFrameIndex + 1, (int)g_replay.frames.size());
+
+                        int frame = g_replay.currentFrameIndex;
+                        if (ImGui::SliderInt("Timeline", &frame, 0, (int)g_replay.frames.size() - 1, overlay)) {
+                            g_replay.currentFrameIndex = frame;
+                            g_replay.currentFrameFloat = (float)frame;
+                            g_replay.state = REPLAY_PAUSED;
+                            state.running = false;
+                        }
+                    }
+                    else {
+                        ImGui::ProgressBar(0.0f, ImVec2(-1, 0), "No Active Recording");
+                    }
+
+                    if (!hasFrames) ImGui::EndDisabled();
+
+                    ImGui::Spacing();
+
+                    // ------------------------------------------------------
+                    // 3. 【新重构】：数据电影导入控制台 (带逆向后缀正则解析 & 自适应网格重整)
+                    // ------------------------------------------------------
+                    ImGui::SeparatorText("Import Wavefield Movie");
+
+                    static char movie_load_path[512] = ""; // 静态路径缓冲区
+                    static int  movie_load_w = 0;  // 缓存待导入的 NX
+                    static int  movie_load_z = 0;  // 缓存待导入的 NZ
+
+                    // A. 文件选择行 (Browse)
+                    ImGui::InputText("Movie Path", movie_load_path, IM_ARRAYSIZE(movie_load_path));
+                    ImGui::SameLine();
+                    if (ImGui::Button("Browse##Mv", ImVec2(65 * scale, 0))) {
+                        char openPath[512] = { 0 };
+                        if (OpenSystemFileDialog(openPath, sizeof(openPath))) {
+                            strcpy_s(movie_load_path, openPath);
+
+                            // 核心自动逆向解析逻辑
+                            int parsed_w = 0, parsed_z = 0;
+                            if (ParseDimensionsFromPath(std::string(movie_load_path), parsed_w, parsed_z)) {
+                                movie_load_w = parsed_w; // 自动填充
+                                movie_load_z = parsed_z; // 自动填充
+                            }
+                            else {
+                                // 如果未能在文件名里识别，降级默认采用当前网格大小作为防呆值
+                                movie_load_w = ctx.NX;
+                                movie_load_z = ctx.NZ;
+                            }
+                        }
+                    }
+
+                    // B. 二维数值编辑参数框 (允许用户手动二次微调)
+                    ImGui::PushItemWidth(120 * scale);
+                    ImGui::InputInt("Import NX", &movie_load_w, 0, 0); ImGui::SameLine();
+                    ImGui::InputInt("Import NZ", &movie_load_z, 0, 0);
+                    ImGui::PopItemWidth();
+
+                    // C. 激活与导入大按钮
+                    bool can_load_movie = (strlen(movie_load_path) > 0) && (movie_load_w > 0) && (movie_load_z > 0);
+                    if (!can_load_movie) ImGui::BeginDisabled();
+
+                    ImGui::Spacing();
+                    if (ImGui::Button("CONFIRM LOAD MOVIE", ImVec2(-1, 30 * scale))) {
+                        if (g_replay.importFromBinary(movie_load_path, movie_load_w, movie_load_z)) {
+                            popup_message = "Wavefield movie imported and locked successfully!\nClick [PLAY] to watch.";
+                            show_success_popup = true;
+                            state.running = false; // 载入电影后自动停止当前时演
+
+                            // =========================================================
+                            // 【高能自适应安全对齐】：如果导入的电影网格与系统当前网格不一致，
+                            //  系统将全自动重新排布 GPU 上下文、重设网格尺寸并重装显存，防止越界闪退！
+                            // =========================================================
+                            if (movie_load_w != ctx.NX || movie_load_z != ctx.NZ) {
+                                std::cout << "[Replay IO] Triggering Auto-Reallocation for imported movie: "
+                                    << movie_load_w << "x" << movie_load_z << std::endl;
+
+                                edit_w = movie_load_w;
+                                edit_h = movie_load_z;
+                                par.model.xnum = edit_w;
+                                par.model.znum = edit_h;
+
+                                setupTestContext(ctx, par);
+                                freeGPUSimulation(gpu_data);
+
+                                cudaGraphicsUnregisterResource(gl.cudaSeisRes);
+                                glBindTexture(GL_TEXTURE_2D, gl.seisTex);
+                                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ctx.NX, ctx.NZ, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                                cudaGraphicsGLRegisterImage(&gl.cudaSeisRes, gl.seisTex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
+
+                                initGPUSimulation(gpu_data, ctx);
+                                first_align_needed = true;
+                            }
+                        }
+                        else {
+                            popup_message = "Failed to read binary stream.\nEnsure the parameters match the original export.";
+                            show_error_popup = true;
+                        }
+                    }
+                    if (!can_load_movie) ImGui::EndDisabled();
+
                     ImGui::EndTabItem();
                 }
 
@@ -3952,25 +4307,49 @@ inline void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandl
     const float scale = (float)winW / 1920.0f;
     const float barHeight = 48.0f * scale;
 
-    // 2. 惰性初始化：仅在首次进入或重算时执行显存与系数分配
+    // 2. 延迟初始化
     InitializeSeismicSimulation(gl);
 
     // 3. 视口自适应对齐与安全吸附
     ApplyCameraAutoAlignment(winW, winH, barHeight);
 
-    // 4. 用户输入捕获：处理平移缩放、一键重置信号、鼠标激发注入
+    // 4. 用户输入捕获
     HandleSeismicInteractions(state, winW, winH, barHeight);
 
-    // 5. 有限差分时演推进：在 GPU 上更新下一帧应力、速度波场
-    UpdateWavefieldSimulation(state);
+    // =========================================================================
+    // 【核心重构】：物理时演推进与波场回放逻辑的分流控制
+    // =========================================================================
+    if (g_replay.state != REPLAY_PLAYING && g_replay.state != REPLAY_PAUSED) {
+        // A. 正常模拟更新状态
+        UpdateWavefieldSimulation(state);
+    }
+    else {
+        // B. 处于波场回放或暂停拖拽状态，停止物理推进，改为高速覆盖显卡中的 Vz 数据
+        ImGuiIO& io = ImGui::GetIO();
+
+        if (g_replay.state == REPLAY_PLAYING && !g_replay.frames.empty()) {
+            // 根据播放倍率自适应推进时间轴
+            g_replay.currentFrameFloat += g_replay.playbackSpeed * (io.DeltaTime * 60.0f);
+            g_replay.currentFrameIndex = static_cast<int>(g_replay.currentFrameFloat);
+
+            if (g_replay.currentFrameIndex >= static_cast<int>(g_replay.frames.size())) {
+                g_replay.currentFrameIndex = 0; // 自动循环播放
+                g_replay.currentFrameFloat = 0.0f;
+            }
+            g_replay.uploadFrameToGPU(g_replay.currentFrameIndex, gpu_data);
+        }
+        else if (g_replay.state == REPLAY_PAUSED && !g_replay.frames.empty()) {
+            // 暂停拖拽时，持续覆写当前拖动的 Frame，保证画面和时间轴 1:1 动态实时刷新
+            g_replay.uploadFrameToGPU(g_replay.currentFrameIndex, gpu_data);
+        }
+    }
 
     // 6. 底图渲染：执行显存 2D 拷贝与 OpenGL 全屏着色渲染
     RenderFullBackbufferWavefield(winW, winH, barHeight, gl);
 
-    // 7. GUI/HUD 覆盖：在最上层绘制刻度物理标尺、科技画笔和 ImGui 交互面板
+    // 7. GUI/HUD 覆盖
     RenderSeisHUD(state, winW, winH, barHeight, scale, gl, info);
-    // =========================================================================
-    // 【核心新增】：挂载全局模态弹窗，使其完美浮在所有层级最顶端，恢复弹窗响应
-    // =========================================================================
+
+    // 8. 模态弹窗
     RenderSeisPopups();
 }
