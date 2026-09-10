@@ -125,6 +125,51 @@ inline float export_target_dx = 1.0f; // µ¼³öÄ¿±êÍø¸ñ¼ä¾à (Ã×£¬Ä¬ÈÏÓëµ±Ç°Ä£Äâ²½³
 inline ReplayManager g_replay; // È«¾ÖÎ¨Ò»µÄ²¨³¡»Ø·Å¹ÜÀíÊµÀı
 
 // =============================================================================
+// ¡¾Êı¾İ²É¼¯ºËĞÄ¡¿£º¼ì²¨Æ÷µ¥µãÎ»ÖÃ
+// =============================================================================
+struct ReceiverPos {
+    int x;
+    int y;
+};
+
+// =============================================================================
+// ¡¾Êı¾İ²É¼¯ºËĞÄ¡¿£ºÊı¾İ²É¼¯ÓëµÀ¼¯Â¼ÖÆ¹ÜÀíÆ÷
+// =============================================================================
+struct AcquisitionManager {
+    float samplingRateHz = 10000.0f; // ²ÉÑùÂÊ
+    float totalDurationSec = 0.5f;    // Â¼ÖÆ×ÜÊ±³¤ (Ãë)
+    float exportIntervalSec = 0.5f;
+    int   numChannels = 100;     // µÀÊı
+    int   startX = 100;     // Æğµã X Íø¸ñ
+    int   endX = 900;     // ÖÕµã X Íø¸ñ
+    int   receiverDepth = 150;     // ÅÅÁĞËùÔÚÉî¶È Z
+
+    std::vector<ReceiverPos> receivers; // ¼ì²¨Æ÷ÎïÀíÍø¸ñ×ø±êÊı×é
+    bool isShowarray = true;            // ÊÇ·ñÔÚ²¨³¡ÉÏÍ¼²ã¸ßÁÁÏÔÊ¾¼ì²¨Æ÷
+    bool isRecording = false;           // ÊÇ·ñ´¦ÓÚÂ¼ÖÆ×´Ì¬
+
+    float totalTimer = 0.0f;      // Â¼ÖÆ¼ÆÊ±Æ÷ (Ãë)
+    float exportTimer = 0.0f;
+    float timer = 0.0f;
+    int   currentFileIndex = 1;
+
+    // ¶şÎ¬²É¼¯Êı¾İ»º³åÇø [channel][sample]
+    std::vector<std::vector<float>> recorded_vx;
+    std::vector<std::vector<float>> recorded_vz;
+
+    // ³õÊ¼»¯/Çå¿Õ²É¼¯»º³åÇø
+    void initBuffer() {
+        int expectedPoints = static_cast<int>(samplingRateHz * totalDurationSec);
+        if (expectedPoints <= 0) expectedPoints = 1000;
+        recorded_vx.assign(numChannels, std::vector<float>(expectedPoints, 0.0f));
+        recorded_vz.assign(numChannels, std::vector<float>(expectedPoints, 0.0f));
+    }
+};
+
+// È«¾ÖÎ¨Ò»µÄ²É¼¯¿ØÖÆÆ÷ÊµÀı
+inline AcquisitionManager rec;
+
+// =============================================================================
 // ¡¾Êı¾İ²É¼¯ºËĞÄ¡¿£ºÈ«×Ô¶¯¶àÅÚÑ­»·²É¼¯×´Ì¬»ú
 // =============================================================================
 enum AutoAcqState {
@@ -153,6 +198,19 @@ struct AutoAcquisition {
         // Ê×ÅÚ×ø±ê×Ô¶¯¶ÔÆëÉè¶¨µÄÎïÀíÆğµãÓë¼¤·¢Éî¶È
         edit_src_x = startX;
         edit_src_z = shotDepthZ;
+
+        // =====================================================================
+        // ¡¾ºËĞÄĞÂÔö¡¿£ºÈ«×Ô¶¯Ê±²½Êı¼ÆËã¶ÔÆë (CFL ²½ÊıËø)
+        //  ¸ù¾İ²É¼¯Ê±³¤×Ô¶¯ÍÆËã²¢ĞŞ¸Ä ctx.nt£¬ÈÃ FDM Ñİ»¯²½ÊıÓë²É¼¯µãÊı 100% ÎïÀí¶Ô³Æ£¡
+        // =====================================================================
+        int required_steps = static_cast<int>(rec.totalDurationSec / ctx.dt);
+        if (required_steps > 0) {
+            ctx.nt = required_steps;
+            temp_nt = required_steps; // Í¬²½¸øÇ°Ì¨»¬Ìõ
+
+            // ÖØĞÂ»æÖÆÍêÃÀ¶ÔÆëÎïÀí²½ÊıµÄ´ó×Ó²¨Êı×é£¬·ÀÖ¹Êı×éÔ½½çºÍÆµÂÊ»û±ä
+            generateRickerWavelet(ctx.wavelet, ctx.nt, ctx.dt, edit_f0, edit_t0);
+        }
     }
 };
 
@@ -1897,50 +1955,7 @@ inline bool ParseDimensionsFromPath(const std::string& path, int& out_w, int& ou
     return false;
 }
 
-// =============================================================================
-// ¡¾Êı¾İ²É¼¯ºËĞÄ¡¿£º¼ì²¨Æ÷µ¥µãÎ»ÖÃ
-// =============================================================================
-struct ReceiverPos {
-    int x;
-    int y;
-};
 
-// =============================================================================
-// ¡¾Êı¾İ²É¼¯ºËĞÄ¡¿£ºÊı¾İ²É¼¯ÓëµÀ¼¯Â¼ÖÆ¹ÜÀíÆ÷
-// =============================================================================
-struct AcquisitionManager {
-    float samplingRateHz = 10000.0f; // ²ÉÑùÂÊ
-    float totalDurationSec = 0.5f;    // Â¼ÖÆ×ÜÊ±³¤ (Ãë)
-    float exportIntervalSec = 0.5f;
-    int   numChannels = 100;     // µÀÊı
-    int   startX = 100;     // Æğµã X Íø¸ñ
-    int   endX = 900;     // ÖÕµã X Íø¸ñ
-    int   receiverDepth = 150;     // ÅÅÁĞËùÔÚÉî¶È Z
-
-    std::vector<ReceiverPos> receivers; // ¼ì²¨Æ÷ÎïÀíÍø¸ñ×ø±êÊı×é
-    bool isShowarray = true;            // ÊÇ·ñÔÚ²¨³¡ÉÏÍ¼²ã¸ßÁÁÏÔÊ¾¼ì²¨Æ÷
-    bool isRecording = false;           // ÊÇ·ñ´¦ÓÚÂ¼ÖÆ×´Ì¬
-
-    float totalTimer = 0.0f;      // Â¼ÖÆ¼ÆÊ±Æ÷ (Ãë)
-    float exportTimer = 0.0f;
-    float timer = 0.0f;
-    int   currentFileIndex = 1;
-
-    // ¶şÎ¬²É¼¯Êı¾İ»º³åÇø [channel][sample]
-    std::vector<std::vector<float>> recorded_vx;
-    std::vector<std::vector<float>> recorded_vz;
-
-    // ³õÊ¼»¯/Çå¿Õ²É¼¯»º³åÇø
-    void initBuffer() {
-        int expectedPoints = static_cast<int>(samplingRateHz * totalDurationSec);
-        if (expectedPoints <= 0) expectedPoints = 1000;
-        recorded_vx.assign(numChannels, std::vector<float>(expectedPoints, 0.0f));
-        recorded_vz.assign(numChannels, std::vector<float>(expectedPoints, 0.0f));
-    }
-};
-
-// È«¾ÖÎ¨Ò»µÄ²É¼¯¿ØÖÆÆ÷ÊµÀı
-inline AcquisitionManager rec;
 
 // =============================================================================
 // ¼ì²¨Æ÷ÅÅÁĞÊı¾İÍ¬²½ÖÁ GPU ÏÔ´æµÄºËĞÄ½Ó¿Ú
@@ -2693,16 +2708,21 @@ inline void UpdateWavefieldSimulation(SimState& state) {
                         }
                     }
 
-                    // ¸üĞÂÂ¼ÖÆÎïÀíÊ±¼ä£¬´ïµ½Éè¶¨Ê±³¤ºó×Ô¶¯½áÊø²¢Ğ´³öÎïÀí¼ÇÂ¼ÎÄ¼ş
+                    // =========================================================
+                    // ¡¾ºËĞÄĞŞ¸´¡¿£ºÖ»ÓĞÔÚ·ÇÈ«×Ô¶¯¶àÅÚ¹¤×÷Á÷×´Ì¬ÏÂ£¬²Å¼¤»îµ¥ÅÚ×Ô¶¯Í£»ú¡£
+                    //  Õâ¿ÉÒÔ·ÀÖ¹µ¥ÅÚÍ£»úÂß¼­ÔÚ×Ô¶¯¶àÅÚÊ±ÑİÖĞÍ¾·¢Éú¶ñÒâÇÀÕ¼¡¢¹ÒÆğĞòÁĞ£¡
+                    // =========================================================
                     rec.totalTimer = current_it * ctx.dt;
-                    if (rec.totalTimer >= rec.totalDurationSec) {
-                        rec.isRecording = false;
-                        state.running = false;
+                    if (g_autoAcq.state != AUTO_ACQ_RUNNING) {
+                        
+                        if (rec.totalTimer >= rec.totalDurationSec) {
+                            rec.isRecording = false;
+                            state.running = false;
 
-                        // ×Ô¶¯Ğ´³öµ½±ê×¼ SEG-Y ÎÄ¼şÖĞ
-                        ExportToSegy(rec, "auto_export_gather.sgy");
-                        popup_message = "Simulation recording completed!\nExported to 'auto_export_gather.sgy'";
-                        show_success_popup = true;
+                            ExportToSegy(rec, "auto_export_gather.sgy");
+                            popup_message = "Simulation recording completed!\nExported to 'auto_export_gather.sgy'";
+                            show_success_popup = true;
+                        }
                     }
                 }
 
@@ -2766,16 +2786,15 @@ inline void UpdateAutoAcquisitionWorkflow(SimState& state, GLHandles& gl) {
         g_autoAcq.currentShotIdx++;
 
         if (g_autoAcq.currentShotIdx < g_autoAcq.totalShots) {
-            // ¼ÆËãÏÂÒ»ÅÚµÄ X Íø¸ñ×ø±ê£¬²¢½øĞĞÎïÀí±ß½ç·À´ôÇ¯Î»
+            // ¼ÆËãÏÂÒ»ÅÚµÄ X Íø¸ñ×ø±ê
             int next_x = g_autoAcq.startX + g_autoAcq.currentShotIdx * g_autoAcq.shotIntervalX;
             edit_src_x = std::clamp(next_x, ctx.npml + 5, ctx.NX - ctx.npml - 5);
-
-            // =================================================================
-            // ¡¾ºËĞÄĞŞ¸´¡¿£ºÈ·±£Ã¿Ò»ÅÚµÄÉî¶ÈÊ¼ÖÕÇ¿ÖÆËøÔÚ×Ô¶¯¶àÅÚÉèÖÃµÄÎïÀíÉî¶ÈÉÏ£¡
-            // =================================================================
             edit_src_z = g_autoAcq.shotDepthZ;
 
-            // ÎïÀí¶ÔÆë£ºÖØÖÃ¼¤·¢Ìõ¼ş£¬×Ô¶¯Çå¿Õ²¨³¡ÖØµş¡¢ÖØ»æ×Ó²¨²¢ÖØĞÂ¼¤·¢£¡
+            // =================================================================
+            // ¡¾ºËĞÄĞŞ¸´¡¿£ºÔÚÌø×ªÖÁÏÂÒ»ÅÚÇ°£¬Ç¿ÖÆÖØĞÂ¸ù¾İ×îĞÂµÄ²½³¤ÖØ»­×Ó²¨£¬
+            //  ²¢Ö´ĞĞÒ»¼ü´óÏµÍ³ÎïÀí³¡¶ÔÆë£¬³¹µ×Çå³ıÀúÊ·¾É²¨³¡²ĞÁô£¡
+            // =================================================================
             TriggerSingleShot(gl, state);
 
             // ÖØÖÃ½ÓÊÕÆ÷ Host ¶Ë»º³åÇø£¬ÖØĞÂÆô¶¯²É¼¯
@@ -4520,7 +4539,7 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
 inline void RenderSeisSimScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl, const GpuInfo& info) {
     // 1. »ùÓÚ´°¿ÚÎïÀí¿í¶È¼ÆËã OSD ±ÈÀıÒò×ÓÓë¶¥²¿/µ×²¿²Ëµ¥À¸¸ß¶È
     const float scale = (float)winW / 1920.0f;
-    const float barHeight = 48.0f * scale;
+    const float barHeight = 38.0f * scale;
 
     // 2. ÑÓ³Ù³õÊ¼»¯
     InitializeSeismicSimulation(gl);

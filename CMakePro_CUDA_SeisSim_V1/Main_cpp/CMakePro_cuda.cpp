@@ -1,4 +1,51 @@
 ﻿/**
+ * @file      CMakePro_CUDA_SeisSim_V1
+ * @author    XIAO YU (1269466423@qq.com)
+ * @brief     GPU-Accelerated Real-Time 2D Elastic Wavefield Simulation, Acquisition & Analysis Sandbox
+ * @version   1.0.0
+ * @date      2026-09-10
+ *
+ * @details
+ * CMakePro_CUDA_SeisSim_V1 is a high-performance, interactive scientific simulation and seismic
+ * data acquisition platform developed with C++17, NVIDIA CUDA, OpenGL 4.3, and Dear ImGui/ImPlot.
+ * It provides real-time, zero-copy physical wavefield propagation and industrial-grade seismic survey tools.
+ *
+ * Key System Capabilities & Architecture:
+ * 1. Physical Governing Equations & Numerical Solvers:
+ *    - First-order velocity-stress elastic wave equations.
+ *    - Staggered-grid finite difference method (FDM): 8th-order spatial and 2nd-order temporal accuracy.
+ *    - Boundary formulations: Whole-domain split PML, hybrid FDM+PML, and traction-free surface (antisymmetric imaging).
+ *    - PML fluid-solid boundary stabilization: automatically solidifies fluid shear modulus (Vs = Vp / 2) to eliminate divergence.
+ *    - Automated CFL stability analysis and safe time-step alignment (CFL = 0.480).
+ *
+ * 2. High-Performance Graphics & Interoperability:
+ *    - CUDA-OpenGL Interoperability (zero-copy VRAM texture streaming) delivering 60+ FPS real-time visualization.
+ *    - FBO off-screen rendering with aspect-ratio correction and pixel-distance adaptive physical scale rulers.
+ *    - Dynamic runtime linking with NVML for real-time GPU core load, temperature, power, and VRAM telemetry.
+ *
+ * 3. Multi-Component Wavefield Separation & Adaptive Scaling:
+ *    - Real-time extraction of 7 physical components: Velocity Mag, Vx, Vy (Z), Normal Stress, Shear Stress,
+ *      pure P-wave (Divergence), and pure S-wave (Curl).
+ *    - Cross-dimensional physical scaling: normalizes stress to strain (sigma / E) and applies wave speed compensation
+ *      (v = Vp * e) for consistent dynamic range across all components.
+ *
+ * 4. Seismic Data Acquisition & Survey Sequencer:
+ *    - Interactive linear geophone array deployment with GPU-side parallel trace gathering.
+ *    - Active triggering (TRIGGER & ACQUIRE) and passive monitoring (START CAPTURE).
+ *    - Automated multi-shot pre-stack gather sequencer with auto-resetting wavefields and coordinate stepping.
+ *    - Standard SEG-Y dual-component (_vx.sgy, _vz.sgy) export embedding 240-byte trace headers with physical coordinates.
+ *
+ * 5. Interactive Sandbox & Wavefield Replay:
+ *    - Real-time physical rock property paintbrushes (keys 1-5: Source, High-V, Low-V, Custom, Eraser) with vertical grid alignment.
+ *    - 11 preset geophysical scenarios (Earth shell/core, double-slit, waveguides, phononic crystal, Penrose room, etc.).
+ *    - CPU-RAM cached wavefield movie recording, binary export, and zero-copy timeline scrubbing playback.
+ *    - Filename dimension auto-parsing for binary movie imports and exports.
+ *
+ * @copyright Copyright (c) 2025-2026 Xiao Yu. All rights reserved.
+ * @license   Licensed under the MIT License.
+ */
+
+/**
  * @file    main.cpp
  * @brief   程序主入口：采用“Intro Screen + Simulation”双模式架构
  */
@@ -283,6 +330,7 @@ int main() {
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
+    ImPlot::DestroyContext();
     ImGui::DestroyContext();
 
     glfwDestroyWindow(window);
