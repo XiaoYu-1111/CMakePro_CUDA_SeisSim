@@ -113,52 +113,78 @@ void Init_Imgui(GLFWwindow* window) {
     // 1. 检查版本并创建上下文
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImPlot::CreateContext(); // [新增] 初始化 ImPlot (建议紧跟 ImGui 创建)
+    ImPlot::CreateContext();
 
     ImGuiIO& io = ImGui::GetIO();
 
-    // 2. 配置 Flags (合并了你代码中重复的部分)
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;       // 允许键盘导航
-    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;           // [关键] 启用 Docking (停靠)
-    //io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;         // [关键] 启用 Viewports (多窗口拖出)
-    // io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;     // 启用手柄 (可选)
+    // 2. 配置 Flags
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    //io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;       
 
-    // 3. 字体加载策略
+    // ================= 修改开始：3. 字体加载策略 =================
     float baseSize = 14.0f;
     float scaleFactor = 1.5f;
     float fontSize = baseSize * scaleFactor;
 
-    std::string font_path = "../resource_CUDA_V1/font/consola.ttf";
+    // 获取 ImGui 内置的中文常用字形范围
+    const ImWchar* glyph_ranges = io.Fonts->GetGlyphRangesChineseSimplifiedCommon();
 
-    // 尝试加载自定义字体
-    ImFont* font = io.Fonts->AddFontFromFileTTF(font_path.c_str(), fontSize);
+    std::string en_font_path = "../resource_CUDA_V1/font/consola.ttf";
 
-    // [安全检查] 如果加载失败 (比如路径不对)，加载默认字体，防止程序崩溃或无文字
+    // 第一步：加载英文字体 (Consolas)
+    ImFont* font = io.Fonts->AddFontFromFileTTF(en_font_path.c_str(), fontSize);
     if (font == nullptr) {
-        // 尝试加载 Windows 系统自带的 consolas
+        // 备用英文系统字体
         font = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/consola.ttf", fontSize);
-        if (font == nullptr) {
-            // 如果还不行，加载 ImGui 内置像素字体
-            io.Fonts->AddFontDefault();
-            fprintf(stderr, "Warning: Failed to load custom font, using default.\n");
+    }
+
+    // 第二步：配置字体合并选项
+    ImFontConfig font_config;
+    font_config.MergeMode = true;        // 开启合并模式
+    font_config.PixelSnapH = true;       // 像素对齐，字体更清晰
+
+    // 第三步：加载中文字体，并增加检测与备选方案
+    ImFont* cn_font = io.Fonts->AddFontFromFileTTF("../resource_CUDA_V1/font/msyh.ttc", fontSize, &font_config, glyph_ranges);
+
+    // [新增] 如果项目目录下的中文字体加载失败，尝试从 Windows 系统目录加载
+    if (cn_font == nullptr) {
+        fprintf(stderr, "Warning: Failed to load custom msyh.ttc, trying system fonts...\n");
+
+        // 尝试 1：系统目录下的微软雅黑
+        cn_font = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/msyh.ttc", fontSize, &font_config, glyph_ranges);
+
+        if (cn_font == nullptr) {
+            // 尝试 2：系统目录下的黑体（作为最后的防线）
+            cn_font = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/simhei.ttf", fontSize, &font_config, glyph_ranges);
+
+            // 如果所有的中文字体都失败了
+            if (cn_font == nullptr) {
+                fprintf(stderr, "Error: Failed to load ANY Chinese font. Chinese characters will show as '?'.\n");
+            }
         }
     }
+
+    // 第四步：[安全检查] 如果连主字体（英文）都彻底失败，才使用 ImGui 默认像素字体
+    if (font == nullptr) {
+        io.Fonts->AddFontDefault();
+        fprintf(stderr, "Warning: Failed to load base custom font, using ImGui default.\n");
+    }
+    // ================= 修改结束 =================
 
     // 4. 设置样式
     SetupImGuiStyle();
 
-    // [关键] 针对 Viewports 的样式微调
-    // 当窗口被拖出主程序时，如果 WindowBg 透明度不是 1.0，可能会看到操作系统桌面，通常很难看
     if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
         ImGuiStyle& style = ImGui::GetStyle();
-        //style.WindowRounding = 0.0f; // 浮动窗口通常不需要圆角 (可选)
-        style.Colors[ImGuiCol_WindowBg].w = 1.0f; // 强制背景不透明
+        style.Colors[ImGuiCol_WindowBg].w = 1.0f;
     }
 
     // 5. 初始化后端
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 430");
 }
+
 // 绘制欢迎/登录界面
 // 辅助函数：将 HSV 转为 ImU32 格式
 ImU32 GetColorFromHSV(float h, float s, float v, float a) {
@@ -310,6 +336,7 @@ void RenderIntroScreen0(SimState& state, int winW, int winH, bool& isIntroMode, 
 
             ImGui::SetWindowFontScale(4.2f * scale);
             ImGui::TextColored({ 1, 1, 1, 0.95f }, "CENTRAL");
+
             ImGui::SameLine();
             ImGui::TextColored({ 0, 0.9f, 1, 1 }, "DISPATCHER");
 
@@ -409,7 +436,7 @@ void RenderIntroScreen0(SimState& state, int winW, int winH, bool& isIntroMode, 
             ImGui::TableSetColumnIndex(0);
             ImGui::TextColored({ 1.0f, 0.3f, 0.3f, 1.0f }, ">> INFRASTRUCTURE.LOG");
             ImGui::Separator(); ImGui::Spacing();
-            HubButton("AUTH_LOGO", "Initialize secure kernel handshake and identity verification nodes.", AppScreen::Intro1, IM_COL32(0, 255, 255, 180));
+            HubButton("你好AUTH_LOGO", "Initialize secure kernel handshake and identity verification nodes.", AppScreen::Intro1, IM_COL32(0, 255, 255, 180));
             HubButton("INTERFACE", "Neural-link topology and system-wide input mapping configuration.", AppScreen::Intro2, IM_COL32(0, 255, 255, 180));
             
             ImGui::TableSetColumnIndex(1);
@@ -417,7 +444,7 @@ void RenderIntroScreen0(SimState& state, int winW, int winH, bool& isIntroMode, 
             ImGui::Separator(); ImGui::Spacing();
             HubButton("BIOME_HOST_CPU", "Heuristic cellular evolution via sequential x64 logic processing.", AppScreen::LifeGame, IM_COL32(0, 255, 255, 220));
             HubButton("BIOME_ACCEL_GPU", "Massively parallel biosphere synthesis utilizing CUDA tensor cores.", AppScreen::LifeGame2, IM_COL32(0, 255, 255, 220));
-            HubButton("SeisSim_GPU", "Massively parallel biosphere synthesis utilizing CUDA tensor cores.", AppScreen::SeisSim_GPU, IM_COL32(0, 255, 255, 220));
+            HubButton("SeisSim_GPU", "CUDA加速 Massively parallel biosphere synthesis utilizing CUDA tensor cores.", AppScreen::SeisSim_GPU, IM_COL32(0, 255, 255, 220));
             ImGui::TableSetColumnIndex(2);
             ImGui::TextColored({ 0, 1, 0.6f, 1 }, ">> COMPUTE.ENGINES");
             ImGui::Separator(); ImGui::Spacing();
@@ -684,7 +711,8 @@ void RenderIntroScreen1(SimState& state, int winW, int winH, bool& isIntroMode, 
                     ImGui::EndDisabled();
                 }
                 else {
-                    if (ImGui::Button("LAUNCH SIMULATION", ImVec2(btnWidth, btnHeight)))
+                    //if (ImGui::Button("LAUNCH SIMULATION", ImVec2(btnWidth, btnHeight)))
+                    if (ImGui::Button((const char*)u8"运行模拟/返回", ImVec2(btnWidth, btnHeight)))
                     {
                         state.currentScreen = AppScreen::Intro0; isIntroMode = false;
                     }
@@ -1369,7 +1397,7 @@ void RenderLifeGameScreen(SimState& state, int winW, int winH) {
         int s = (int)totalSimTime % 60;
 
         char timeStr[32];
-        sprintf(timeStr, "SIM_TIME: %02d:%02d:%02d", h, m, s);
+        sprintf_s(timeStr, "SIM_TIME: %02d:%02d:%02d", h, m, s);
         float timeWidth = ImGui::CalcTextSize(timeStr).x;
         // 自动居中对齐
         ImGui::SetCursorPos({ (winW - timeWidth) * 0.5f, 15 * scale });
@@ -1778,7 +1806,7 @@ void RenderLifeGameScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl
         // --- B. 中间：模拟状态 (自动居中) ---
         int h = (int)totalSimTime / 3600, m = ((int)totalSimTime / 60) % 60, s = (int)totalSimTime % 60;
         char statusStr[128];
-        sprintf(statusStr, "RUNTIME: %02d:%02d:%02d  >>  GEN: %d  >>  UNITS: %d", h, m, s, generation, population);
+        sprintf_s(statusStr, "RUNTIME: %02d:%02d:%02d  >>  GEN: %d  >>  UNITS: %d", h, m, s, generation, population);
 
         float textWidth = ImGui::CalcTextSize(statusStr).x;
         ImGui::SetCursorPos({ (winW - textWidth) * 0.5f, centerY });
@@ -1894,7 +1922,7 @@ void RenderLifeGameScreen_GPU(SimState& state, int winW, int winH, GLHandles& gl
             ImGui::Text("TOTAL_CELLS: %d", gl.simW * gl.simH);
             // D. 性能与人口图表
             char overlay[64];
-            sprintf(overlay, "CUR: %d | MAX: %.0f", population, maxPopFound);
+            sprintf_s(overlay, "CUR: %d | MAX: %.0f", population, maxPopFound);
 
             ImGui::PushStyleColor(ImGuiCol_PlotLines, trailColor); // 线条颜色随主题变
             ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0.3f)); // 背景透明
@@ -2525,7 +2553,7 @@ void RenderCudaDiagnosticsScreen(SimState& state, const GpuInfo& info, int winW,
         ImGui::Text("DEDICATED_VIDEO_MEMORY:");
 
         ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.0f, 0.8f, 0.7f, 0.8f));
-        char vram_label[32]; sprintf(vram_label, "%.2f GB TOTAL", vram_gb);
+        char vram_label[32]; sprintf_s(vram_label, "%.2f GB TOTAL", vram_gb);
         // 修正宽度计算：使用 -30*scale 以填满右边距
         ImGui::ProgressBar(vram_gb / 16.0f, ImVec2(-30 * scale, 28 * scale), vram_label);
         ImGui::PopStyleColor(1);

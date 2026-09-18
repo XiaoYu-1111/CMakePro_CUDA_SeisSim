@@ -1,12 +1,12 @@
-#include "SeismicIO.h"
+ï»¿#include "SeismicIO.h"
 
 namespace SeismicIO {
 
     // =============================================================================
-    // 1. µ×²ã´ó/Ğ¡¶ËĞò×ª»»Óë¸¡µãÊı¸ñÊ½×ª»»Ëã·¨ (IBM/IEEE)
+    // 1. åº•å±‚å¤§/å°ç«¯åºè½¬æ¢ä¸æµ®ç‚¹æ•°æ ¼å¼è½¬æ¢ç®—æ³• (IBM/IEEE)
     // =============================================================================
 
-    // ½»»» 4 ×Ö½Ú´ó¶Ë×ªĞ¡¶Ë (int/float)
+    // äº¤æ¢ 4 å­—èŠ‚å¤§ç«¯è½¬å°ç«¯ (int/float)
     uint32_t swap4byte(uint32_t value) {
         return ((value & 0xFF000000) >> 24) |
             ((value & 0x00FF0000) >> 8) |
@@ -14,18 +14,18 @@ namespace SeismicIO {
             ((value & 0x000000FF) << 24);
     }
 
-    // ½»»» 2 ×Ö½Ú´ó¶Ë×ªĞ¡¶Ë (short)
+    // äº¤æ¢ 2 å­—èŠ‚å¤§ç«¯è½¬å°ç«¯ (short)
     int16_t swap2byte(int16_t value) {
-        // Ç¿ÖÆ×ª»»ÎªÎŞ·ûºÅ½øĞĞÒÆÎ»£¬·ÀÖ¹·ûºÅÎ»À©Õ¹ÎÊÌâ
+        // å¼ºåˆ¶è½¬æ¢ä¸ºæ— ç¬¦å·è¿›è¡Œç§»ä½ï¼Œé˜²æ­¢ç¬¦å·ä½æ‰©å±•é—®é¢˜
         uint16_t uval = static_cast<uint16_t>(value);
         return static_cast<int16_t>((uval >> 8) | (uval << 8));
     }
 
-    // IBM Float ×ª IEEE Float (Ñ§Êõ¼¶¸ßËÙ×ª»»ÊµÏÖ)
+    // IBM Float è½¬ IEEE Float (å­¦æœ¯çº§é«˜é€Ÿè½¬æ¢å®ç°)
     float ibm2float(uint32_t x) {
         if (x == 0) return 0.0f;
 
-        // IBM ¸ñÊ½: 
+        // IBM æ ¼å¼: 
         // Bit 0: Sign
         // Bit 1-7: Exponent (Base 16, Bias 64)
         // Bit 8-31: Mantissa (24 bits)
@@ -33,8 +33,8 @@ namespace SeismicIO {
         int exponent = (x >> 24) & 0x7F;
         int mantissa = x & 0x00FFFFFF;
 
-        // IBM Ö¸ÊıÊÇ 16 ½øÖÆµÄ£¬Bias Îª 64
-        // Öµ = (-1)^sign * 0.mantissa * 16^(exponent - 64)
+        // IBM æŒ‡æ•°æ˜¯ 16 è¿›åˆ¶çš„ï¼ŒBias ä¸º 64
+        // å€¼ = (-1)^sign * 0.mantissa * 16^(exponent - 64)
         float f_mant = static_cast<float>(mantissa) * 5.96046448e-8f; // * 1.0 / pow(2, 24)
         float result = (1.0f - 2.0f * sign) * f_mant * std::pow(16.0f, exponent - 64);
 
@@ -42,39 +42,39 @@ namespace SeismicIO {
     }
 
     // =============================================================================
-    // 2. ¶şÎ¬ SEG-Y Êı¾İ¸ß±£Õæ¶ÁÈ¡Çı¶¯
+    // 2. äºŒç»´ SEG-Y æ•°æ®é«˜ä¿çœŸè¯»å–é©±åŠ¨
     // =============================================================================
     std::vector<std::vector<float>> readSegyFile2D(std::string inputfile) {
         std::ifstream filein(inputfile, std::ios::binary);
 
-        // 1. ´íÎó¼ì²é£º´ò¿ªÊ§°ÜÁ¢¼´·µ»Ø
+        // 1. é”™è¯¯æ£€æŸ¥ï¼šæ‰“å¼€å¤±è´¥ç«‹å³è¿”å›
         if (!filein.is_open()) {
             std::cerr << "Error: Cannot open file " << inputfile << std::endl;
             return {};
         }
 
-        // 2. ¶ÁÈ¡¾íÍ·
-        // 3200 ×Ö½Ú ÎÄ±¾¾íÍ· (EBCDIC or ASCII) - ÔİÊ±Ìø¹ı²»´¦Àí
+        // 2. è¯»å–å·å¤´
+        // 3200 å­—èŠ‚ æ–‡æœ¬å·å¤´ (EBCDIC or ASCII) - æš‚æ—¶è·³è¿‡ä¸å¤„ç†
         filein.seekg(3200, std::ios::beg);
 
-        // 400 ×Ö½Ú ¶ş½øÖÆ¾íÍ·
+        // 400 å­—èŠ‚ äºŒè¿›åˆ¶å·å¤´
         std::vector<char> binHeader(400);
         filein.read(binHeader.data(), 400);
 
-        // ¶ÁÈ¡²ÉÑùµãÊı (Bytes 20-21 in binary header, i.e., index 20)
-        // ×¢Òâ£ºSEGY ±ê×¼ÊÇ´ó¶ËĞò (Big-Endian)
+        // è¯»å–é‡‡æ ·ç‚¹æ•° (Bytes 20-21 in binary header, i.e., index 20)
+        // æ³¨æ„ï¼šSEGY æ ‡å‡†æ˜¯å¤§ç«¯åº (Big-Endian)
         int16_t* pSampleCount = reinterpret_cast<int16_t*>(&binHeader[20]);
         int      trace_length = swap2byte(*pSampleCount);
 
-        // ¶ÁÈ¡Êı¾İ¸ñÊ½´úÂë (Bytes 24-25 in binary header, i.e., index 24)
+        // è¯»å–æ•°æ®æ ¼å¼ä»£ç  (Bytes 24-25 in binary header, i.e., index 24)
         // 1 = IBM Float, 5 = IEEE Float
         int16_t* pFormatCode = reinterpret_cast<int16_t*>(&binHeader[24]);
         int      format_code = swap2byte(*pFormatCode);
 
-        // 3. ¼ÆËãµÀÊı
+        // 3. è®¡ç®—é“æ•°
         filein.seekg(0, std::ios::end);
         long long fileSize = filein.tellg();
-        long long trace_total_bytes = 240 + 4 * static_cast<long long>(trace_length); // µÀÍ· 240 ×Ö½Ú + Êı¾İ
+        long long trace_total_bytes = 240 + 4 * static_cast<long long>(trace_length); // é“å¤´ 240 å­—èŠ‚ + æ•°æ®
         long long traces = (fileSize - 3600) / trace_total_bytes;
 
         std::cout << "File: " << inputfile << "\n"
@@ -88,25 +88,25 @@ namespace SeismicIO {
             return {};
         }
 
-        // 4. ¶ÁÈ¡Êı¾İ
-        filein.seekg(3600, std::ios::beg); // Ìø»ØµÚÒ»µÀ¿ªÊ¼´¦
+        // 4. è¯»å–æ•°æ®
+        filein.seekg(3600, std::ios::beg); // è·³å›ç¬¬ä¸€é“å¼€å§‹å¤„
 
-        // Ô¤·ÖÅäÄÚ´æ£¬±ÜÃâ vector ¶¯Ì¬ËõÈİ
+        // é¢„åˆ†é…å†…å­˜ï¼Œé¿å… vector åŠ¨æ€ç¼©å®¹
         std::vector<std::vector<float>> dataArray(traces, std::vector<float>(trace_length));
 
-        // »º³åÇø£ºÃ¿´Î¶ÁÈ¡Ò»µÀµÄÊı¾İ²¿·Ö (4 bytes * length)
+        // ç¼“å†²åŒºï¼šæ¯æ¬¡è¯»å–ä¸€é“çš„æ•°æ®éƒ¨åˆ† (4 bytes * length)
         std::vector<char>     traceHeader(240);
         std::vector<uint32_t> rawData(trace_length);
 
         for (int i = 0; i < traces; i++) {
             if (i % 10000 == 0 && i > 0) std::cout << "Reading trace: " << i << std::endl;
 
-            // ¶ÁÈ¡µÀÍ·ºÍµÀÊı¾İ
+            // è¯»å–é“å¤´å’Œé“æ•°æ®
             filein.read(traceHeader.data(), 240);
             filein.read(reinterpret_cast<char*>(rawData.data()), trace_length * 4);
 
             for (int j = 0; j < trace_length; j++) {
-                // SEGY ÊÇ´ó¶ËĞò£¬PC ÊÇĞ¡¶ËĞò£¬±ØĞë½»»»×Ö½Ú
+                // SEGY æ˜¯å¤§ç«¯åºï¼ŒPC æ˜¯å°ç«¯åºï¼Œå¿…é¡»äº¤æ¢å­—èŠ‚
                 uint32_t val = swap4byte(rawData[j]);
 
                 if (format_code == 1) {
@@ -120,7 +120,7 @@ namespace SeismicIO {
                     dataArray[i][j] = f_val;
                 }
                 else {
-                    // Ä¬ÈÏ½µ¼¶Îª IEEE
+                    // é»˜è®¤é™çº§ä¸º IEEE
                     float f_val;
                     std::memcpy(&f_val, &val, sizeof(float));
                     dataArray[i][j] = f_val;
@@ -133,7 +133,7 @@ namespace SeismicIO {
     }
 
     // =============================================================================
-    // 3. ±£´æ¶şÎ¬ÆÊÃæÎïĞÔÄ£ĞÍÎª±ê×¼ SEGY ¸ñÊ½ (ÖØÔØ 1)
+    // 3. ä¿å­˜äºŒç»´å‰–é¢ç‰©æ€§æ¨¡å‹ä¸ºæ ‡å‡† SEGY æ ¼å¼ (é‡è½½ 1)
     // =============================================================================
     void writeSegyFile2D(const std::vector<std::vector<float>>& dataArray, const std::string outputfile, float dt) {
         std::ofstream fileout(outputfile, std::ios::binary);
@@ -147,7 +147,7 @@ namespace SeismicIO {
         int num_samples = dataArray[0].size();
 
         // ---------------------------------------------------------
-        // 1. Ğ´ÈëÎÄ±¾¾íÍ· (3200 bytes)
+        // 1. å†™å…¥æ–‡æœ¬å·å¤´ (3200 bytes)
         // ---------------------------------------------------------
         std::vector<char> textHeader(3200, ' ');
         std::string       desc = "C01 SEGY FILE GENERATED BY SEIS-FDM-TOOL";
@@ -155,52 +155,52 @@ namespace SeismicIO {
         fileout.write(textHeader.data(), 3200);
 
         // ---------------------------------------------------------
-        // 2. Ğ´Èë¶ş½øÖÆ¾íÍ· (400 bytes)
+        // 2. å†™å…¥äºŒè¿›åˆ¶å·å¤´ (400 bytes)
         // ---------------------------------------------------------
         std::vector<char> binHeader(400, 0);
 
-        // Byte 17-18: ²ÉÑù¼ä¸ô (Î¢Ãë)
+        // Byte 17-18: é‡‡æ ·é—´éš” (å¾®ç§’)
         int16_t interval_us = static_cast<int16_t>(dt * 1000000);
         int16_t be_interval = swap2byte(interval_us);
         std::memcpy(&binHeader[16], &be_interval, 2);
 
-        // Byte 21-22: Ã¿µÀ²ÉÑùµãÊı
+        // Byte 21-22: æ¯é“é‡‡æ ·ç‚¹æ•°
         int16_t samples = static_cast<int16_t>(num_samples);
         int16_t be_samples = swap2byte(samples);
         std::memcpy(&binHeader[20], &be_samples, 2);
 
-        // Byte 25-26: Êı¾İ¸ñÊ½´úÂë (5 = IEEE Float)
+        // Byte 25-26: æ•°æ®æ ¼å¼ä»£ç  (5 = IEEE Float)
         int16_t format = swap2byte(5);
         std::memcpy(&binHeader[24], &format, 2);
 
         fileout.write(binHeader.data(), 400);
 
         // ---------------------------------------------------------
-        // 3. Ğ´ÈëµÀÊı¾İ (Trace Header + Data)
+        // 3. å†™å…¥é“æ•°æ® (Trace Header + Data)
         // ---------------------------------------------------------
         std::vector<char> traceHeader(240, 0);
 
         for (int i = 0; i < num_traces; ++i) {
             std::fill(traceHeader.begin(), traceHeader.end(), 0);
 
-            // Byte 1-4: ÏßºÅ/µÀË³ĞòºÅ (Trace sequence number within line)
+            // Byte 1-4: çº¿å·/é“é¡ºåºå· (Trace sequence number within line)
             int32_t trace_seq = swap4byte(i + 1);
             std::memcpy(&traceHeader[0], &trace_seq, 4);
 
-            // Byte 115-116: ²ÉÑùµãÊı
+            // Byte 115-116: é‡‡æ ·ç‚¹æ•°
             std::memcpy(&traceHeader[114], &be_samples, 2);
 
-            // Byte 117-118: ²ÉÑù¼ä¸ô (Î¢Ãë)
+            // Byte 117-118: é‡‡æ ·é—´éš” (å¾®ç§’)
             std::memcpy(&traceHeader[116], &be_interval, 2);
 
-            // Ğ´ÈëµÀÍ·
+            // å†™å…¥é“å¤´
             fileout.write(traceHeader.data(), 240);
 
-            // --- Ğ´ÈëÊı¾İ (IEEE Float Big-Endian) ---
+            // --- å†™å…¥æ•°æ® (IEEE Float Big-Endian) ---
             for (int j = 0; j < num_samples; ++j) {
                 float val = dataArray[i][j];
 
-                // Ç¿×ªÎª uint32 ½øĞĞÎ»²Ù×÷
+                // å¼ºè½¬ä¸º uint32 è¿›è¡Œä½æ“ä½œ
                 uint32_t val_int;
                 std::memcpy(&val_int, &val, 4);
 
@@ -214,7 +214,7 @@ namespace SeismicIO {
     }
 
     // =============================================================================
-    // 4. ÖØÔØ 2£º´Ó 1D Flat vector Ğ´Èë (¸ßĞÔÄÜ£¬ÎŞ¿½±´)
+    // 4. é‡è½½ 2ï¼šä» 1D Flat vector å†™å…¥ (é«˜æ€§èƒ½ï¼Œæ— æ‹·è´)
     // =============================================================================
     void writeSegyFile2D(const std::vector<float>& flatData, int nTraces, int nSamples, const std::string& outputfile, float dt) {
         std::ofstream fileout(outputfile, std::ios::binary);
@@ -261,7 +261,7 @@ namespace SeismicIO {
     }
 
     // =============================================================================
-    // 5. ¡¾ĞÂÔö¡¿£ºÖØÔØ 3£º×¨ÓÃÓÚ¡°µØÕğµÀ¼¯Êı¾İ²É¼¯£¨Shot Gather£©¡±µÄ¸ß±£Õæµ¼³ö
+    // 5. ã€æ–°å¢ã€‘ï¼šé‡è½½ 3ï¼šä¸“ç”¨äºâ€œåœ°éœ‡é“é›†æ•°æ®é‡‡é›†ï¼ˆShot Gatherï¼‰â€çš„é«˜ä¿çœŸå¯¼å‡º
     // =============================================================================
     void writeSegyFile2D(const std::vector<std::vector<float>>& dataArray,
         const std::vector<TraceMetadata>& metadata,
@@ -303,59 +303,59 @@ namespace SeismicIO {
         for (int i = 0; i < num_traces; ++i) {
             std::fill(traceHeader.begin(), traceHeader.end(), 0);
 
-            // »ñÈ¡¸ÃµÀ¶ÔÓ¦µÄ²É¼¯ÎïÀíÔªÊı¾İ (×ö·À¿ÕÇ¯Î»±£»¤)
+            // è·å–è¯¥é“å¯¹åº”çš„é‡‡é›†ç‰©ç†å…ƒæ•°æ® (åšé˜²ç©ºé’³ä½ä¿æŠ¤)
             TraceMetadata meta;
             if (i < static_cast<int>(metadata.size())) {
                 meta = metadata[i];
             }
             else {
-                // Èç¹ûÍâ²¿Ã»ÓĞ´«Èë×ã¹»µÄÔªÊı¾İ£¬ÍË»¯²¢ÉèÖÃ±¾µÀĞòºÅÎªÄ¬ÈÏÖµ
+                // å¦‚æœå¤–éƒ¨æ²¡æœ‰ä¼ å…¥è¶³å¤Ÿçš„å…ƒæ•°æ®ï¼Œé€€åŒ–å¹¶è®¾ç½®æœ¬é“åºå·ä¸ºé»˜è®¤å€¼
                 meta.traceInRecord = i + 1;
                 meta.fieldRecordNum = 1;
             }
 
             // -------------------------------------------------------------
-            // A. µÀÍ·ÎïÀíÎ»ÖÃ±ê×¼Ó³ÉäÓë×Ö½ÚĞò×ª»» (´ó¶Ë) [2]
+            // A. é“å¤´ç‰©ç†ä½ç½®æ ‡å‡†æ˜ å°„ä¸å­—èŠ‚åºè½¬æ¢ (å¤§ç«¯) [2]
             // -------------------------------------------------------------
-            // Bytes 1-4: ÏßÄÚµÀË³ĞòºÅ [2]
+            // Bytes 1-4: çº¿å†…é“é¡ºåºå· [2]
             int32_t trace_seq = swap4byte(i + 1);
             std::memcpy(&traceHeader[0], &trace_seq, 4);
 
-            // Bytes 9-12: Ô­Ê¼Ò°Íâ¼ÇÂ¼Éú²úºÅ (Field Record / Shot ID) [2]
+            // Bytes 9-12: åŸå§‹é‡å¤–è®°å½•ç”Ÿäº§å· (Field Record / Shot ID) [2]
             int32_t f_record = swap4byte(meta.fieldRecordNum);
             std::memcpy(&traceHeader[8], &f_record, 4);
 
-            // Bytes 13-16: Ò°Íâ¼ÇÂ¼ÖĞµÄµÀĞòºÅ (Trace ID) [2]
+            // Bytes 13-16: é‡å¤–è®°å½•ä¸­çš„é“åºå· (Trace ID) [2]
             int32_t t_record = swap4byte(meta.traceInRecord);
             std::memcpy(&traceHeader[12], &t_record, 4);
 
-            // Bytes 73-76: ÕğÔ´ÎïÀí X ×ø±ê (Source X) [2]
+            // Bytes 73-76: éœ‡æºç‰©ç† X åæ ‡ (Source X) [2]
             int32_t src_x = swap4byte(meta.sourceX);
             std::memcpy(&traceHeader[72], &src_x, 4);
 
-            // Bytes 77-80: ÕğÔ´ÎïÀí Y ×ø±ê (Source Y) [2]
+            // Bytes 77-80: éœ‡æºç‰©ç† Y åæ ‡ (Source Y) [2]
             int32_t src_y = swap4byte(meta.sourceY);
             std::memcpy(&traceHeader[76], &src_y, 4);
 
-            // Bytes 81-84: ¼ì²¨µãÎïÀí X ×ø±ê (Group X) [2]
+            // Bytes 81-84: æ£€æ³¢ç‚¹ç‰©ç† X åæ ‡ (Group X) [2]
             int32_t grp_x = swap4byte(meta.groupX);
             std::memcpy(&traceHeader[80], &grp_x, 4);
 
-            // Bytes 85-88: ¼ì²¨µãÎïÀí Y ×ø±ê (Group Y) [2]
+            // Bytes 85-88: æ£€æ³¢ç‚¹ç‰©ç† Y åæ ‡ (Group Y) [2]
             int32_t grp_y = swap4byte(meta.groupY);
             std::memcpy(&traceHeader[84], &grp_y, 4);
 
-            // Bytes 115-116: µ¥µÀ²ÉÑùµãÊı
+            // Bytes 115-116: å•é“é‡‡æ ·ç‚¹æ•°
             std::memcpy(&traceHeader[114], &be_samples, 2);
 
-            // Bytes 117-118: µ¥µÀ²ÉÑùÂÊ (Î¢Ãë)
+            // Bytes 117-118: å•é“é‡‡æ ·ç‡ (å¾®ç§’)
             std::memcpy(&traceHeader[116], &be_interval, 2);
 
-            // Ğ´Èë 240 ×Ö½Ú Trace Header [2]
+            // å†™å…¥ 240 å­—èŠ‚ Trace Header [2]
             fileout.write(traceHeader.data(), 240);
 
             // -------------------------------------------------------------
-            // B. Ğ´ÈëÊµ¼ÊµÀ¼¯²¨ĞÎÕñ·ùÊı¾İ (IEEE Big-Endian)
+            // B. å†™å…¥å®é™…é“é›†æ³¢å½¢æŒ¯å¹…æ•°æ® (IEEE Big-Endian)
             // -------------------------------------------------------------
             for (int j = 0; j < num_samples; ++j) {
                 float val = dataArray[i][j];
@@ -374,7 +374,7 @@ namespace SeismicIO {
     }
 
     // =============================================================================
-    // 6. ÎÄ±¾¸ñÊ½µ¼³ö
+    // 6. æ–‡æœ¬æ ¼å¼å¯¼å‡º
     // =============================================================================
     void writeTextFile2D(const std::vector<std::vector<float>>& dataArray, const std::string& outputfile) {
         std::ofstream fileout(outputfile);

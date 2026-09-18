@@ -72,6 +72,7 @@ if (MSVC)
     target_compile_options(${TARGET_NAME} PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:/FS>
     )
+    add_compile_options(/utf-8)
 endif()
 
 # 针对不同语言的特定编译选项
