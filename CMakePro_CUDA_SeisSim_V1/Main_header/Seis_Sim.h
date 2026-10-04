@@ -55,8 +55,8 @@ inline int   current_it = 0;
 inline float accumulated_compute_time = 0.0f;
 inline float color_scale = 20.0f;
 inline int   show_component = 2;     // 0: Vz, 1: Vx
-inline int   waveStyle = 0;     // 默认采用 Style 7 (Turbo)
-inline int   modelStyle = 3; // 0: 钛金灰, 1: 科学地质图, 2: 灰度Vp, 3: 跟随波场, 4: 科学白背景
+inline int   waveStyle = 4;     // 默认采用 Style 7 (Turbo)
+inline int   modelStyle = 1; // 0: 钛金灰, 1: 科学地质图, 2: 灰度Vp, 3: 跟随波场, 4: 科学白背景
 inline int   steps_per_frame = 20;
 inline bool  showHUD = true;
 inline bool  show_Monitor_par = false;
@@ -1196,13 +1196,13 @@ inline void LoadScenario(int type) {
     }
     else if (type == SCENE_REFRACTION) {
         // 速度连续线性增加的梯度介质 (折射和回转回弹波)
-        float vTop = 2000.0f, vBot = 5500.0f;
-        float rhoTop = 1800.0f, rhoBot = 3000.0f;
+        float vTop = 1000.0f, vBot = 2000.0f;
+        float rhoTop = 1800.0f, rhoBot = 2500.0f;
         for (int y = 0; y < H; ++y) {
             float ratio = (float)y / (float)H;
             float vp = vBot + (vTop - vBot) * ratio;
             float vs = vp / 1.732f;
-            if (vp < 1600.0f) vs = 0.0f;
+            if (vp < 1000.0f) vs = 0.0f;
             float rho = rhoBot + (rhoTop - rhoBot) * ratio;
 
             for (int x = 0; x < W; ++x) SetMaterialAt(x, y, vp, vs, rho);

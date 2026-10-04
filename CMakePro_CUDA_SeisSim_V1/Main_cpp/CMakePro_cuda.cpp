@@ -144,6 +144,10 @@ int main() {
     // -----------------------------------------------------------------------------
     // Stage 1: CUDA 硬件环境诊断
     // -----------------------------------------------------------------------------
+    // 设置控制台输出编码为UTF-8
+    SetConsoleOutputCP(CP_UTF8);
+    // 可选：控制台输入也设UTF8
+    SetConsoleCP(CP_UTF8);
     std::cout << "========= CUDA 硬件环境测试 =========" << std::endl;
     GpuInfo info = GetCudaDeviceInfo();
     if (info.success) {

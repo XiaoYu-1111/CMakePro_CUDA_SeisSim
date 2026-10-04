@@ -143,9 +143,9 @@ target_link_libraries(${TARGET_NAME} PRIVATE
     shell32.lib
     
     # SDL2
-    SDL2.lib
-    SDL2_image.lib
-    SDL2_mixer.lib
+    #SDL2.lib
+    #SDL2_image.lib
+    #SDL2_mixer.lib
 
     # CUDA (显式路径下的库名)
     cudart.lib
