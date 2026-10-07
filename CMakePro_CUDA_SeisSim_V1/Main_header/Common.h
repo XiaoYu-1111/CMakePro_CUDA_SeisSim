@@ -29,13 +29,11 @@
 
 // 应用程序激活页面/屏幕索引
 enum class AppScreen {
-    Intro0 = 0,     // 启动欢迎页 (Logo/版权)
-    Intro1,         // 引导页1
-    Intro2,         // 引导页2
-    LifeGame,       // 生命游戏cpu
+    Intro1=0,         // 引导页1
+    Intro0,     // 启动欢迎页 (Logo/版权)
+    CudaDiagno,
     LifeGame2,      // 生命游戏gpu
     HamStation,
-    CudaDiagno,
     SeisSim_GPU,    // CUDA 地震波场模拟屏
     Count
 };
