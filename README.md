@@ -53,6 +53,17 @@
 
 ![Performance](CMakePro_CUDA_SeisSim_V1/Pro_Picture/计算效率表.png)
 
+### 模拟展示ABC区域 
+|  (Tab 1) |  (Tab 2) |  (Tab 3) |
+| :---: | :---: | :---: |
+| ![模型1](CMakePro_CUDA_SeisSim_V1/Pro_Picture/marmousi_sample2.5mA.png) | ![模型2](CMakePro_CUDA_SeisSim_V1/Pro_Picture/marmousi_sample2.5mB.png) | ![模型3](CMakePro_CUDA_SeisSim_V1/Pro_Picture/circle_10m.png) |
+|  (Tab 1) |  (Tab 2) |  (Tab 3) |
+| ![多切片显示](CMakePro_CUDA_SeisSim_V1/Pro_Picture/marmousiA.png) | ![多切片显示](CMakePro_CUDA_SeisSim_V1/Pro_Picture/marmousiB.png) | ![多切片显示](CMakePro_CUDA_SeisSim_V1/Pro_Picture/marmousiC.png) |
+|  (Tab 1) |  (Tab 2) |  (Tab 3) |
+| ![模型1](CMakePro_CUDA_SeisSim_V1/Pro_Picture/marmousi_outdata3.png) | ![模型2](CMakePro_CUDA_SeisSim_V1/Pro_Picture/custom1.png) | ![模型3](CMakePro_CUDA_SeisSim_V1/Pro_Picture/circle_test.png) |
+|  (Tab 1) |  (Tab 2) |  (Tab 3) |
+| ![模型1](CMakePro_CUDA_SeisSim_V1/Pro_Picture/500_500.png) | ![模型2](CMakePro_CUDA_SeisSim_V1/Pro_Picture/1000_1000.png) | ![模型3](CMakePro_CUDA_SeisSim_V1/Pro_Picture/2000_2000.png) |
+
 ---
 
 # 1. 技术架构
