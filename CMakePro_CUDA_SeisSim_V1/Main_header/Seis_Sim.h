@@ -119,6 +119,8 @@ inline float cached_max_rho = 0.0f;
 inline float cached_min_rho = 0.0f;
 inline float cached_vram_mb = 0.0f; // 估算显存占用
 
+inline bool convert_rho=true;
+
 inline float edit_segy_dx = 1.0f; // 外部导入 SEG-Y 时实际物理道间距 (米)
 inline float export_target_dx = 1.0f; // 导出目标网格间距 (米，默认与当前模拟步长对齐)
 
@@ -1462,8 +1464,10 @@ inline std::vector<std::vector<float>> PadPmlToGrid2D(
             float rho = grid_rho[src_x][src_z];
 
             // 智能量纲转换 (g/cm3 转 kg/m3)
-            if (rho > 0.0f && rho < 10.0f) rho *= 1000.0f;
-            if (rho < 10.0f) rho = 1000.0f;
+            if (convert_rho) {
+                if (rho > 0.0f && rho < 10.0f) rho *= 1000.0f;
+                if (rho < 10.0f) rho = 1000.0f;
+            }
 
             // 如果该点处于 PML 内部，且原先是液态地层（Vs == 0）
             // 在 PML 内部强行将其“固化”为剪切波速为 Vp / 2 的稳定固体介质，消灭 PML 奇点
@@ -3593,6 +3597,7 @@ inline void RenderSeisHUD(SimState& state, int winW, int winH, float barHeight, 
 
                     static bool flipSegyY = true;
                     static bool flipSegyX = false;
+                    ImGui::Checkbox("if (rho > 0.0f && rho < 10.0f) rho *= 1000.0f;", &convert_rho);
                     ImGui::Checkbox("Flip Vertically on SEGY Import", &flipSegyY);
                     ImGui::Checkbox("Flip Horizontally on SEGY Import", &flipSegyX);
                     ImGui::Spacing();
